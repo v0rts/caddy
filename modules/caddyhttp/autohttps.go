@@ -152,7 +152,9 @@ func (app *App) automaticHTTPSPhase1(ctx caddy.Context, repl *caddy.Replacer) er
 								return fmt.Errorf("%s: route %d, matcher set %d, matcher %d, host matcher %d: %v",
 									srvName, routeIdx, matcherSetIdx, matcherIdx, hostMatcherIdx, err)
 							}
-							if !srv.AutoHTTPS.Skipped(d, srv.AutoHTTPS.Skip) {
+							// only include domain if it's not explicitly skipped and it's not a Tailscale domain
+							// (the implicit Tailscale manager module will get those certs at run-time)
+							if !srv.AutoHTTPS.Skipped(d, srv.AutoHTTPS.Skip) && !isTailscaleDomain(d) {
 								serverDomainSet[d] = struct{}{}
 							}
 						}
@@ -220,11 +222,15 @@ func (app *App) automaticHTTPSPhase1(ctx caddy.Context, repl *caddy.Replacer) er
 		app.logger.Info("enabling automatic HTTP->HTTPS redirects", zap.String("server_name", srvName))
 
 		// create HTTP->HTTPS redirects
-		for _, addr := range srv.Listen {
+		for _, listenAddr := range srv.Listen {
 			// figure out the address we will redirect to...
-			addr, err := caddy.ParseNetworkAddress(addr)
+			addr, err := caddy.ParseNetworkAddress(listenAddr)
 			if err != nil {
-				return fmt.Errorf("%s: invalid listener address: %v", srvName, addr)
+				msg := "%s: invalid listener address: %v"
+				if strings.Count(listenAddr, ":") > 1 {
+					msg = msg + ", there are too many colons, so the port is ambiguous. Did you mean to wrap the IPv6 address with [] brackets?"
+				}
+				return fmt.Errorf(msg, srvName, listenAddr)
 			}
 
 			// this address might not have a hostname, i.e. might be a
@@ -478,7 +484,7 @@ func (app *App) createAutomationPolicies(ctx caddy.Context, internalNames []stri
 			if err != nil {
 				return err
 			}
-			ap.Managers = []certmagic.CertificateManager{ts}
+			ap.Managers = []certmagic.Manager{ts}
 		}
 
 		// while we're here, is this the catch-all/base policy?
@@ -495,7 +501,7 @@ func (app *App) createAutomationPolicies(ctx caddy.Context, internalNames []stri
 			return err
 		}
 		basePolicy = &caddytls.AutomationPolicy{
-			Managers: []certmagic.CertificateManager{ts},
+			Managers: []certmagic.Manager{ts},
 		}
 	}
 
@@ -686,6 +692,10 @@ func implicitTailscale(ctx caddy.Context) (caddytls.Tailscale, error) {
 	ts := caddytls.Tailscale{Optional: true}
 	err := ts.Provision(ctx)
 	return ts, err
+}
+
+func isTailscaleDomain(name string) bool {
+	return strings.HasSuffix(strings.ToLower(name), ".ts.net")
 }
 
 type acmeCapable interface{ GetACMEIssuer() *caddytls.ACMEIssuer }

@@ -148,6 +148,9 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 			case "http.request.duration":
 				start := GetVar(req.Context(), "start_time").(time.Time)
 				return time.Since(start), true
+			case "http.request.duration_ms":
+				start := GetVar(req.Context(), "start_time").(time.Time)
+				return time.Since(start).Seconds() * 1e3, true // multiply seconds to preserve decimal (see #4666)
 			case "http.request.uuid":
 				id := GetVar(req.Context(), "uuid").(*requestID)
 				return id.String(), true
@@ -162,12 +165,8 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				// read the request body into a buffer (can't pool because we
 				// don't know its lifetime and would have to make a copy anyway)
 				buf := new(bytes.Buffer)
-				_, err := io.Copy(buf, req.Body)
-				if err != nil {
-					return "", true
-				}
-				// replace real body with buffered data
-				req.Body = io.NopCloser(buf)
+				_, _ = io.Copy(buf, req.Body) // can't handle error, so just ignore it
+				req.Body = io.NopCloser(buf)  // replace real body with buffered data
 				return buf.String(), true
 
 				// original request, before any internal changes

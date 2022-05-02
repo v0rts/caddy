@@ -19,12 +19,20 @@ jobs:
       fail-fast: false
       matrix:
         os: [ ubuntu-latest, macos-latest, windows-latest ]
-        go: [ '1.16', '1.17' ]
+        go: [ '1.17', '1.18' ]
+
+        include:
+        # Set the minimum Go patch version for the given Go minor
+        # Usable via ${{ matrix.GO_SEMVER }}
+        - go: '1.17'
+          GO_SEMVER: '~1.17.9'
+
+        - go: '1.18'
+          GO_SEMVER: '~1.18.1'
 
         # Set some variables per OS, usable via ${{ matrix.VAR }}
         # CADDY_BIN_PATH: the path to the compiled Caddy binary, for artifact publishing
         # SUCCESS: the typical value for $? per OS (Windows/pwsh returns 'True')
-        include:
         - os: ubuntu-latest
           CADDY_BIN_PATH: ./cmd/caddy/caddy
           SUCCESS: 0
@@ -41,12 +49,13 @@ jobs:
 
     steps:
     - name: Install Go
-      uses: actions/setup-go@v2
+      uses: actions/setup-go@v3
       with:
-        go-version: ${{ matrix.go }}
+        go-version: ${{ matrix.GO_SEMVER }}
+        check-latest: true
 
     - name: Checkout code
-      uses: actions/checkout@v2
+      uses: actions/checkout@v3
 
     # These tools would be useful if we later decide to reinvestigate
     # publishing test/coverage reports to some tool for easier consumption
@@ -130,7 +139,7 @@ jobs:
     continue-on-error: true  # August 2020: s390x VM is down due to weather and power issues
     steps:
       - name: Checkout code into the Go module directory
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
       - name: Run Tests
         run: |
           mkdir -p ~/.ssh && echo -e "${SSH_KEY//_/\\n}" > ~/.ssh/id_ecdsa && chmod og-rwx ~/.ssh/id_ecdsa
@@ -155,7 +164,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
       
       - uses: goreleaser/goreleaser-action@v2
         with:
