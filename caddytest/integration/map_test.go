@@ -13,6 +13,7 @@ func TestMap(t *testing.T) {
 	tester.InitServer(`{
 		http_port     9080
 		https_port    9443
+		grace_period  1
 	}
 
 	localhost:9080 {
@@ -60,7 +61,7 @@ func TestMapRespondWithDefault(t *testing.T) {
 	tester.AssertPostResponseBody("http://localhost:9080/version", []string{}, bytes.NewBuffer([]byte{}), 200, "hello from localhost unknown")
 }
 
-func TestMapAsJson(t *testing.T) {
+func TestMapAsJSON(t *testing.T) {
 	// arrange
 	tester := caddytest.NewTester(t)
 	tester.InitServer(`
@@ -85,7 +86,7 @@ func TestMapAsJson(t *testing.T) {
 													{
 														"handler": "map",
 														"source": "{http.request.method}",
-														"destinations": ["dest-name"],
+														"destinations": ["{dest-name}"],
 														"defaults": ["unknown"],
 														"mappings": [
 															{

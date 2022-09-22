@@ -27,6 +27,8 @@ import (
 	caddycmd "github.com/caddyserver/caddy/v2/cmd"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp/headers"
+	"github.com/caddyserver/caddy/v2/modules/caddytls"
+	"go.uber.org/zap"
 )
 
 func init() {
@@ -40,6 +42,7 @@ A simple but production-ready reverse proxy. Useful for quick deployments,
 demos, and development.
 
 Simply shuttles HTTP(S) traffic from the --from address to the --to address.
+Multiple --to addresses may be specified by repeating the flag.
 
 Unless otherwise specified in the addresses, the --from address will be
 assumed to be HTTPS if a hostname is given, and the --to address will be
@@ -56,9 +59,11 @@ default, all incoming headers are passed through unmodified.)
 		Flags: func() *flag.FlagSet {
 			fs := flag.NewFlagSet("reverse-proxy", flag.ExitOnError)
 			fs.String("from", "localhost", "Address on which to receive traffic")
-			fs.String("to", "", "Upstream address to which traffic should be sent")
+			fs.Var(&reverseProxyCmdTo, "to", "Upstream address(es) to which traffic should be sent")
 			fs.Bool("change-host-header", false, "Set upstream Host header to address of upstream")
 			fs.Bool("insecure", false, "Disable TLS verification (WARNING: DISABLES SECURITY BY NOT VERIFYING SSL CERTIFICATES!)")
+			fs.Bool("internal-certs", false, "Use internal CA for issuing certs")
+			fs.Bool("debug", false, "Enable verbose debug logs")
 			return fs
 		}(),
 	})
@@ -68,14 +73,15 @@ func cmdReverseProxy(fs caddycmd.Flags) (int, error) {
 	caddy.TrapSignals()
 
 	from := fs.String("from")
-	to := fs.String("to")
 	changeHost := fs.Bool("change-host-header")
 	insecure := fs.Bool("insecure")
+	internalCerts := fs.Bool("internal-certs")
+	debug := fs.Bool("debug")
 
 	httpPort := strconv.Itoa(caddyhttp.DefaultHTTPPort)
 	httpsPort := strconv.Itoa(caddyhttp.DefaultHTTPSPort)
 
-	if to == "" {
+	if len(reverseProxyCmdTo) == 0 {
 		return caddy.ExitCodeFailedStartup, fmt.Errorf("--to is required")
 	}
 
@@ -103,9 +109,18 @@ func cmdReverseProxy(fs caddycmd.Flags) (int, error) {
 	}
 
 	// set up the upstream address; assume missing information from given parts
-	toAddr, toScheme, err := parseUpstreamDialAddress(to)
-	if err != nil {
-		return caddy.ExitCodeFailedStartup, fmt.Errorf("invalid upstream address %s: %v", to, err)
+	// mixing schemes isn't supported, so use first defined (if available)
+	toAddresses := make([]string, len(reverseProxyCmdTo))
+	var toScheme string
+	for i, toLoc := range reverseProxyCmdTo {
+		addr, scheme, err := parseUpstreamDialAddress(toLoc)
+		if err != nil {
+			return caddy.ExitCodeFailedStartup, fmt.Errorf("invalid upstream address %s: %v", toLoc, err)
+		}
+		if scheme != "" && toScheme != "" {
+			toScheme = scheme
+		}
+		toAddresses[i] = addr
 	}
 
 	// proceed to build the handler and server
@@ -117,9 +132,16 @@ func cmdReverseProxy(fs caddycmd.Flags) (int, error) {
 		}
 	}
 
+	upstreamPool := UpstreamPool{}
+	for _, toAddr := range toAddresses {
+		upstreamPool = append(upstreamPool, &Upstream{
+			Dial: toAddr,
+		})
+	}
+
 	handler := Handler{
 		TransportRaw: caddyconfig.JSONModuleObject(ht, "protocol", "http", nil),
-		Upstreams:    UpstreamPool{{Dial: toAddr}},
+		Upstreams:    upstreamPool,
 	}
 
 	if changeHost {
@@ -154,11 +176,37 @@ func cmdReverseProxy(fs caddycmd.Flags) (int, error) {
 		Servers: map[string]*caddyhttp.Server{"proxy": server},
 	}
 
+	appsRaw := caddy.ModuleMap{
+		"http": caddyconfig.JSON(httpApp, nil),
+	}
+	if internalCerts && fromAddr.Host != "" {
+		tlsApp := caddytls.TLS{
+			Automation: &caddytls.AutomationConfig{
+				Policies: []*caddytls.AutomationPolicy{{
+					Subjects:   []string{fromAddr.Host},
+					IssuersRaw: []json.RawMessage{json.RawMessage(`{"module":"internal"}`)},
+				}},
+			},
+		}
+		appsRaw["tls"] = caddyconfig.JSON(tlsApp, nil)
+	}
+
+	var false bool
 	cfg := &caddy.Config{
-		Admin: &caddy.AdminConfig{Disabled: true},
-		AppsRaw: caddy.ModuleMap{
-			"http": caddyconfig.JSON(httpApp, nil),
+		Admin: &caddy.AdminConfig{Disabled: true,
+			Config: &caddy.ConfigSettings{
+				Persist: &false,
+			},
 		},
+		AppsRaw: appsRaw,
+	}
+
+	if debug {
+		cfg.Logging = &caddy.Logging{
+			Logs: map[string]*caddy.CustomLog{
+				"default": {Level: zap.DebugLevel.CapitalString()},
+			},
+		}
 	}
 
 	err = caddy.Run(cfg)
@@ -166,7 +214,15 @@ func cmdReverseProxy(fs caddycmd.Flags) (int, error) {
 		return caddy.ExitCodeFailedStartup, err
 	}
 
-	fmt.Printf("Caddy proxying %s -> %s\n", fromAddr.String(), toAddr)
+	for _, to := range toAddresses {
+		fmt.Printf("Caddy proxying %s -> %s\n", fromAddr.String(), to)
+	}
+	if len(toAddresses) > 1 {
+		fmt.Println("Load balancing policy: random")
+	}
 
 	select {}
 }
+
+// reverseProxyCmdTo holds the parsed values from repeated use of the --to flag.
+var reverseProxyCmdTo caddycmd.StringSlice

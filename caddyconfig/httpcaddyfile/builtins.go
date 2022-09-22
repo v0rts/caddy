@@ -48,12 +48,12 @@ func init() {
 	RegisterHandlerDirective("handle", parseHandle)
 	RegisterDirective("handle_errors", parseHandleErrors)
 	RegisterDirective("log", parseLog)
+	RegisterHandlerDirective("skip_log", parseSkipLog)
 }
 
 // parseBind parses the bind directive. Syntax:
 //
-//     bind <addresses...>
-//
+//	bind <addresses...>
 func parseBind(h Helper) ([]ConfigValue, error) {
 	var lnHosts []string
 	for h.Next() {
@@ -64,28 +64,28 @@ func parseBind(h Helper) ([]ConfigValue, error) {
 
 // parseTLS parses the tls directive. Syntax:
 //
-//     tls [<email>|internal]|[<cert_file> <key_file>] {
-//         protocols <min> [<max>]
-//         ciphers   <cipher_suites...>
-//         curves    <curves...>
-//         client_auth {
-//             mode                   [request|require|verify_if_given|require_and_verify]
-//             trusted_ca_cert        <base64_der>
-//             trusted_ca_cert_file   <filename>
-//             trusted_leaf_cert      <base64_der>
-//             trusted_leaf_cert_file <filename>
-//         }
-//         alpn      <values...>
-//         load      <paths...>
-//         ca        <acme_ca_endpoint>
-//         ca_root   <pem_file>
-//         dns       <provider_name> [...]
-//         on_demand
-//         eab    <key_id> <mac_key>
-//         issuer <module_name> [...]
-//         get_certificate <module_name> [...]
-//     }
-//
+//	tls [<email>|internal]|[<cert_file> <key_file>] {
+//	    protocols <min> [<max>]
+//	    ciphers   <cipher_suites...>
+//	    curves    <curves...>
+//	    client_auth {
+//	        mode                   [request|require|verify_if_given|require_and_verify]
+//	        trusted_ca_cert        <base64_der>
+//	        trusted_ca_cert_file   <filename>
+//	        trusted_leaf_cert      <base64_der>
+//	        trusted_leaf_cert_file <filename>
+//	    }
+//	    alpn      <values...>
+//	    load      <paths...>
+//	    ca        <acme_ca_endpoint>
+//	    ca_root   <pem_file>
+//	    dns       <provider_name> [...]
+//	    on_demand
+//	    eab    <key_id> <mac_key>
+//	    issuer <module_name> [...]
+//	    get_certificate <module_name> [...]
+//	    insecure_secrets_log <log_file>
+//	}
 func parseTLS(h Helper) ([]ConfigValue, error) {
 	cp := new(caddytls.ConnectionPolicy)
 	var fileLoader caddytls.FileLoader
@@ -395,6 +395,12 @@ func parseTLS(h Helper) ([]ConfigValue, error) {
 				}
 				onDemand = true
 
+			case "insecure_secrets_log":
+				if !h.NextArg() {
+					return nil, h.ArgErr()
+				}
+				cp.InsecureSecretsLog = h.Val()
+
 			default:
 				return nil, h.Errf("unknown subdirective: %s", h.Val())
 			}
@@ -515,8 +521,7 @@ func parseTLS(h Helper) ([]ConfigValue, error) {
 
 // parseRoot parses the root directive. Syntax:
 //
-//     root [<matcher>] <path>
-//
+//	root [<matcher>] <path>
 func parseRoot(h Helper) (caddyhttp.MiddlewareHandler, error) {
 	var root string
 	for h.Next() {
@@ -540,8 +545,13 @@ func parseVars(h Helper) (caddyhttp.MiddlewareHandler, error) {
 
 // parseRedir parses the redir directive. Syntax:
 //
-//     redir [<matcher>] <to> [<code>]
+//	redir [<matcher>] <to> [<code>]
 //
+// <code> can be "permanent" for 301, "temporary" for 302 (default),
+// a placeholder, or any number in the 3xx range or 401. The special
+// code "html" can be used to redirect only browser clients (will
+// respond with HTTP 200 and no Location header; redirect is performed
+// with JS and a meta tag).
 func parseRedir(h Helper) (caddyhttp.MiddlewareHandler, error) {
 	if !h.Next() {
 		return nil, h.ArgErr()
@@ -558,6 +568,7 @@ func parseRedir(h Helper) (caddyhttp.MiddlewareHandler, error) {
 	}
 
 	var body string
+	var hdr http.Header
 	switch code {
 	case "permanent":
 		code = "301"
@@ -578,20 +589,37 @@ func parseRedir(h Helper) (caddyhttp.MiddlewareHandler, error) {
 `
 		safeTo := html.EscapeString(to)
 		body = fmt.Sprintf(metaRedir, safeTo, safeTo, safeTo, safeTo)
-		code = "302"
+		code = "200" // don't redirect non-browser clients
 	default:
+		// Allow placeholders for the code
+		if strings.HasPrefix(code, "{") {
+			break
+		}
+		// Try to validate as an integer otherwise
 		codeInt, err := strconv.Atoi(code)
 		if err != nil {
 			return nil, h.Errf("Not a supported redir code type or not valid integer: '%s'", code)
 		}
-		if codeInt < 300 || codeInt > 399 {
-			return nil, h.Errf("Redir code not in the 3xx range: '%v'", codeInt)
+		// Sometimes, a 401 with Location header is desirable because
+		// requests made with XHR will "eat" the 3xx redirect; so if
+		// the intent was to redirect to an auth page, a 3xx won't
+		// work. Responding with 401 allows JS code to read the
+		// Location header and do a window.location redirect manually.
+		// see https://stackoverflow.com/a/2573589/846934
+		// see https://github.com/oauth2-proxy/oauth2-proxy/issues/1522
+		if codeInt < 300 || (codeInt > 399 && codeInt != 401) {
+			return nil, h.Errf("Redir code not in the 3xx range or 401: '%v'", codeInt)
 		}
+	}
+
+	// don't redirect non-browser clients
+	if code != "200" {
+		hdr = http.Header{"Location": []string{to}}
 	}
 
 	return caddyhttp.StaticResponse{
 		StatusCode: caddyhttp.WeakString(code),
-		Headers:    http.Header{"Location": []string{to}},
+		Headers:    hdr,
 		Body:       body,
 	}, nil
 }
@@ -671,12 +699,11 @@ func parseHandleErrors(h Helper) ([]ConfigValue, error) {
 
 // parseLog parses the log directive. Syntax:
 //
-//     log {
-//         output <writer_module> ...
-//         format <encoder_module> ...
-//         level  <level>
-//     }
-//
+//	log {
+//	    output <writer_module> ...
+//	    format <encoder_module> ...
+//	    level  <level>
+//	}
 func parseLog(h Helper) ([]ConfigValue, error) {
 	return parseLogHelper(h, nil)
 }
@@ -834,4 +861,16 @@ func parseLogHelper(h Helper, globalLogNames map[string]struct{}) ([]ConfigValue
 		})
 	}
 	return configValues, nil
+}
+
+// parseSkipLog parses the skip_log directive. Syntax:
+//
+//	skip_log [<matcher>]
+func parseSkipLog(h Helper) (caddyhttp.MiddlewareHandler, error) {
+	for h.Next() {
+		if h.NextArg() {
+			return nil, h.ArgErr()
+		}
+	}
+	return caddyhttp.VarsMiddleware{"skip_log": true}, nil
 }
