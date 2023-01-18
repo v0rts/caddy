@@ -64,7 +64,7 @@ jobs:
     #     go get github.com/axw/gocov/gocov
     #     go get github.com/AlekSi/gocov-xml
     #     go get -u github.com/jstemmer/go-junit-report
-    #     echo "::add-path::$(go env GOPATH)/bin"
+    #     echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
 
     - name: Print Go version and environment
       id: vars
@@ -77,10 +77,10 @@ jobs:
         env
         printf "Git version: $(git version)\n\n"
         # Calculate the short SHA1 hash of the git commit
-        echo "::set-output name=short_sha::$(git rev-parse --short HEAD)"
+        echo "short_sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
     - name: Cache the build cache
-      uses: actions/cache@v2
+      uses: actions/cache@v3
       with:
         # In order:
         # * Module download cache
@@ -109,7 +109,7 @@ jobs:
         go build -trimpath -ldflags="-w -s" -v
 
     - name: Publish Build Artifact
-      uses: actions/upload-artifact@v1
+      uses: actions/upload-artifact@v3
       with:
         name: caddy_${{ runner.os }}_go${{ matrix.go }}_${{ steps.vars.outputs.short_sha }}
         path: ${{ matrix.CADDY_BIN_PATH }}
@@ -123,7 +123,7 @@ jobs:
       run: |
         # (go test -v -coverprofile=cover-profile.out -race ./... 2>&1) > test-results/test-result.out
         go test -v -coverprofile="cover-profile.out" -short -race ./...
-        # echo "::set-output name=status::$?"
+        # echo "status=$?" >> $GITHUB_OUTPUT
 
     # Relevant step if we reinvestigate publishing test/coverage reports
     # - name: Prepare coverage reports
@@ -143,7 +143,7 @@ jobs:
   s390x-test:
     name: test (s390x on IBM Z)
     runs-on: ubuntu-latest
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'
     continue-on-error: true  # August 2020: s390x VM is down due to weather and power issues
     steps:
       - name: Checkout code into the Go module directory
@@ -156,17 +156,18 @@ jobs:
           short_sha=$(git rev-parse --short HEAD)
 
           # The environment is fresh, so there's no point in keeping accepting and adding the key.
-          rsync -arz -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" --progress --delete --exclude '.git' . caddy-ci@ci-s390x.caddyserver.com:/var/tmp/"$short_sha"
-          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -t caddy-ci@ci-s390x.caddyserver.com "cd /var/tmp/$short_sha; go version; go env; printf "\n\n";CGO_ENABLED=0 go test -v ./..."
+          rsync -arz -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" --progress --delete --exclude '.git' . "$CI_USER"@ci-s390x.caddyserver.com:/var/tmp/"$short_sha"
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -t "$CI_USER"@ci-s390x.caddyserver.com "cd /var/tmp/$short_sha; go version; go env; printf "\n\n";CGO_ENABLED=0 go test -v ./..."
           test_result=$?
 
           # There's no need leaving the files around
-          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null caddy-ci@ci-s390x.caddyserver.com "rm -rf /var/tmp/'$short_sha'"
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$CI_USER"@ci-s390x.caddyserver.com "rm -rf /var/tmp/'$short_sha'"
 
           echo "Test exit code: $test_result"
           exit $test_result
         env:
           SSH_KEY: ${{ secrets.S390X_SSH_KEY }}
+          CI_USER: ${{ secrets.CI_USER }}
 
   goreleaser-check:
     runs-on: ubuntu-latest
@@ -174,7 +175,7 @@ jobs:
       - name: checkout
         uses: actions/checkout@v3
       
-      - uses: goreleaser/goreleaser-action@v2
+      - uses: goreleaser/goreleaser-action@v4
         with:
           version: latest
           args: check

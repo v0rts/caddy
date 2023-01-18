@@ -57,7 +57,7 @@ type AdminConfig struct {
 
 	// The address to which the admin endpoint's listener should
 	// bind itself. Can be any single network address that can be
-	// parsed by Caddy. Default: localhost:2019
+	// parsed by Caddy. Accepts placeholders. Default: localhost:2019
 	Listen string `json:"listen,omitempty"`
 
 	// If true, CORS headers will be emitted, and requests to the
@@ -156,7 +156,7 @@ type IdentityConfig struct {
 //
 // EXPERIMENTAL: Subject to change.
 type RemoteAdmin struct {
-	// The address on which to start the secure listener.
+	// The address on which to start the secure listener. Accepts placeholders.
 	// Default: :2021
 	Listen string `json:"listen,omitempty"`
 
@@ -382,7 +382,7 @@ func replaceLocalAdminServer(cfg *Config) error {
 
 	handler := cfg.Admin.newAdminHandler(addr, false)
 
-	ln, err := Listen(addr.Network, addr.JoinHostPort(0))
+	ln, err := addr.Listen(context.TODO(), 0, net.ListenConfig{})
 	if err != nil {
 		return err
 	}
@@ -403,7 +403,7 @@ func replaceLocalAdminServer(cfg *Config) error {
 		serverMu.Lock()
 		server := localAdminServer
 		serverMu.Unlock()
-		if err := server.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
+		if err := server.Serve(ln.(net.Listener)); !errors.Is(err, http.ErrServerClosed) {
 			adminLogger.Error("admin server shutdown for unknown reason", zap.Error(err))
 		}
 	}()
@@ -549,10 +549,11 @@ func replaceRemoteAdminServer(ctx Context, cfg *Config) error {
 	serverMu.Unlock()
 
 	// start listener
-	ln, err := Listen(addr.Network, addr.JoinHostPort(0))
+	lnAny, err := addr.Listen(ctx, 0, net.ListenConfig{})
 	if err != nil {
 		return err
 	}
+	ln := lnAny.(net.Listener)
 	ln = tls.NewListener(ln, tlsConfig)
 
 	go func() {
@@ -571,12 +572,13 @@ func replaceRemoteAdminServer(ctx Context, cfg *Config) error {
 }
 
 func (ident *IdentityConfig) certmagicConfig(logger *zap.Logger, makeCache bool) *certmagic.Config {
+	var cmCfg *certmagic.Config
 	if ident == nil {
 		// user might not have configured identity; that's OK, we can still make a
 		// certmagic config, although it'll be mostly useless for remote management
 		ident = new(IdentityConfig)
 	}
-	cmCfg := &certmagic.Config{
+	template := certmagic.Config{
 		Storage: DefaultStorage, // do not act as part of a cluster (this is for the server's local identity)
 		Logger:  logger,
 		Issuers: ident.issuers,
@@ -586,9 +588,11 @@ func (ident *IdentityConfig) certmagicConfig(logger *zap.Logger, makeCache bool)
 			GetConfigForCert: func(certmagic.Certificate) (*certmagic.Config, error) {
 				return cmCfg, nil
 			},
+			Logger: logger.Named("cache"),
 		})
 	}
-	return certmagic.New(identityCertCache, *cmCfg)
+	cmCfg = certmagic.New(identityCertCache, template)
+	return cmCfg
 }
 
 // IdentityCredentials returns this instance's configured, managed identity credentials
@@ -1246,7 +1250,10 @@ func (e APIError) Error() string {
 // parseAdminListenAddr extracts a singular listen address from either addr
 // or defaultAddr, returning the network and the address of the listener.
 func parseAdminListenAddr(addr string, defaultAddr string) (NetworkAddress, error) {
-	input := addr
+	input, err := NewReplacer().ReplaceOrErr(addr, true, true)
+	if err != nil {
+		return NetworkAddress{}, fmt.Errorf("replacing listen address: %v", err)
+	}
 	if input == "" {
 		input = defaultAddr
 	}

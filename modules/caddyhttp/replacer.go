@@ -31,6 +31,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/textproto"
 	"net/url"
 	"path"
@@ -196,6 +197,37 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				return or.URL.RawQuery, true
 			}
 
+			// remote IP range/prefix (e.g. keep top 24 bits of 1.2.3.4  => "1.2.3.0/24")
+			// syntax: "/V4,V6" where V4 = IPv4 bits, and V6 = IPv6 bits; if no comma, then same bit length used for both
+			// (EXPERIMENTAL)
+			if strings.HasPrefix(key, "http.request.remote.host/") {
+				host, _, err := net.SplitHostPort(req.RemoteAddr)
+				if err != nil {
+					host = req.RemoteAddr // assume no port, I guess?
+				}
+				addr, err := netip.ParseAddr(host)
+				if err != nil {
+					return host, true // not an IP address
+				}
+				// extract the bits from the end of the placeholder (start after "/") then split on ","
+				bitsBoth := key[strings.Index(key, "/")+1:]
+				ipv4BitsStr, ipv6BitsStr, cutOK := strings.Cut(bitsBoth, ",")
+				bitsStr := ipv4BitsStr
+				if addr.Is6() && cutOK {
+					bitsStr = ipv6BitsStr
+				}
+				// convert to integer then compute prefix
+				bits, err := strconv.Atoi(bitsStr)
+				if err != nil {
+					return "", true
+				}
+				prefix, err := addr.Prefix(bits)
+				if err != nil {
+					return "", true
+				}
+				return prefix.String(), true
+			}
+
 			// hostname labels
 			if strings.HasPrefix(key, reqHostLabelsReplPrefix) {
 				idxStr := key[len(reqHostLabelsReplPrefix):]
@@ -234,11 +266,31 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				return pathParts[idx], true
 			}
 
+			// orig uri path parts
+			if strings.HasPrefix(key, reqOrigURIPathReplPrefix) {
+				idxStr := key[len(reqOrigURIPathReplPrefix):]
+				idx, err := strconv.Atoi(idxStr)
+				if err != nil {
+					return "", false
+				}
+				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				pathParts := strings.Split(or.URL.Path, "/")
+				if len(pathParts) > 0 && pathParts[0] == "" {
+					pathParts = pathParts[1:]
+				}
+				if idx < 0 {
+					return "", false
+				}
+				if idx >= len(pathParts) {
+					return "", true
+				}
+				return pathParts[idx], true
+			}
+
 			// middleware variables
 			if strings.HasPrefix(key, varsReplPrefix) {
 				varName := key[len(varsReplPrefix):]
-				tbl := req.Context().Value(VarsCtxKey).(map[string]any)
-				raw := tbl[varName]
+				raw := GetVar(req.Context(), varName)
 				// variables can be dynamic, so always return true
 				// even when it may not be set; treat as empty then
 				return raw, true
@@ -439,12 +491,13 @@ func (rid *requestID) String() string {
 }
 
 const (
-	reqCookieReplPrefix     = "http.request.cookie."
-	reqHeaderReplPrefix     = "http.request.header."
-	reqHostLabelsReplPrefix = "http.request.host.labels."
-	reqTLSReplPrefix        = "http.request.tls."
-	reqURIPathReplPrefix    = "http.request.uri.path."
-	reqURIQueryReplPrefix   = "http.request.uri.query."
-	respHeaderReplPrefix    = "http.response.header."
-	varsReplPrefix          = "http.vars."
+	reqCookieReplPrefix      = "http.request.cookie."
+	reqHeaderReplPrefix      = "http.request.header."
+	reqHostLabelsReplPrefix  = "http.request.host.labels."
+	reqTLSReplPrefix         = "http.request.tls."
+	reqURIPathReplPrefix     = "http.request.uri.path."
+	reqURIQueryReplPrefix    = "http.request.uri.query."
+	respHeaderReplPrefix     = "http.response.header."
+	varsReplPrefix           = "http.vars."
+	reqOrigURIPathReplPrefix = "http.request.orig_uri.path."
 )

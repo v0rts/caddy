@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2/caddytest"
 )
@@ -16,7 +17,17 @@ func TestSRVReverseProxy(t *testing.T) {
 	tester := caddytest.NewTester(t)
 	tester.InitServer(`
 	{
+		"admin": {
+			"listen": "localhost:2999"
+		},
 		"apps": {
+			"pki": {
+				"certificate_authorities" : {
+					"local" : {
+					"install_trust": false
+					}
+				}
+			},
 		  "http": {
 			"grace_period": 1,
 			"servers": {
@@ -50,6 +61,13 @@ func TestSRVWithDial(t *testing.T) {
 	caddytest.AssertLoadError(t, `
 	{
 		"apps": {
+			"pki": {
+				"certificate_authorities" : {
+				  "local" : {
+					"install_trust": false
+				  }
+				}
+			  },
 		  "http": {
 			"grace_period": 1,
 			"servers": {
@@ -115,7 +133,17 @@ func TestDialWithPlaceholderUnix(t *testing.T) {
 	tester := caddytest.NewTester(t)
 	tester.InitServer(`
 	{
+		"admin": {
+			"listen": "localhost:2999"
+		},
 		"apps": {
+			"pki": {
+				"certificate_authorities" : {
+				  "local" : {
+					"install_trust": false
+				  }
+				}
+			  },
 		  "http": {
 			"grace_period": 1,
 			"servers": {
@@ -157,7 +185,17 @@ func TestReverseProxyWithPlaceholderDialAddress(t *testing.T) {
 	tester := caddytest.NewTester(t)
 	tester.InitServer(`
 	{
+		"admin": {
+			"listen": "localhost:2999"
+		},
 		"apps": {
+			"pki": {
+				"certificate_authorities" : {
+				  "local" : {
+					"install_trust": false
+				  }
+				}
+			  },
 			"http": {
 				"grace_period": 1,
 				"servers": {
@@ -241,7 +279,17 @@ func TestReverseProxyWithPlaceholderTCPDialAddress(t *testing.T) {
 	tester := caddytest.NewTester(t)
 	tester.InitServer(`
 	{
+		"admin": {
+			"listen": "localhost:2999"
+		},
 		"apps": {
+			"pki": {
+				"certificate_authorities" : {
+				  "local" : {
+					"install_trust": false
+				  }
+				}
+			  },
 			"http": {
 				"grace_period": 1,
 				"servers": {
@@ -325,6 +373,13 @@ func TestSRVWithActiveHealthcheck(t *testing.T) {
 	caddytest.AssertLoadError(t, `
 	{
 		"apps": {
+			"pki": {
+				"certificate_authorities" : {
+				  "local" : {
+					"install_trust": false
+				  }
+				}
+			  },
 		  "http": {
 			"grace_period": 1,
 			"servers": {
@@ -363,8 +418,11 @@ func TestReverseProxyHealthCheck(t *testing.T) {
 	tester := caddytest.NewTester(t)
 	tester.InitServer(`
 	{
+		skip_install_trust
+		admin localhost:2999
 		http_port     9080
 		https_port    9443
+		grace_period 1ns
 	}
 	http://localhost:2020 {
 		respond "Hello, World!"
@@ -378,12 +436,13 @@ func TestReverseProxyHealthCheck(t *testing.T) {
 	
 			health_uri /health
 			health_port 2021
-			health_interval 2s
-			health_timeout 5s
+			health_interval 10ms
+			health_timeout 100ms
 		}
 	}
   `, "caddyfile")
 
+	time.Sleep(100 * time.Millisecond) // TODO: for some reason this test seems particularly flaky, getting 503 when it should be 200, unless we wait
 	tester.AssertGetResponse("http://localhost:9080/", 200, "Hello, World!")
 }
 
@@ -424,8 +483,11 @@ func TestReverseProxyHealthCheckUnixSocket(t *testing.T) {
 
 	tester.InitServer(fmt.Sprintf(`
 	{
+		skip_install_trust
+		admin localhost:2999
 		http_port     9080
 		https_port    9443
+		grace_period 1ns
 	}
 	http://localhost:9080 {
 		reverse_proxy {
@@ -479,8 +541,11 @@ func TestReverseProxyHealthCheckUnixSocketWithoutPort(t *testing.T) {
 
 	tester.InitServer(fmt.Sprintf(`
 	{
+		skip_install_trust
+		admin localhost:2999
 		http_port     9080
 		https_port    9443
+		grace_period 1ns
 	}
 	http://localhost:9080 {
 		reverse_proxy {

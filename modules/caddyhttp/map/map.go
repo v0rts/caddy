@@ -40,6 +40,7 @@ type Handler struct {
 	Source string `json:"source,omitempty"`
 
 	// Destinations are the names of placeholders in which to store the outputs.
+	// Destination values should be wrapped in braces, for example, {my_placeholder}.
 	Destinations []string `json:"destinations,omitempty"`
 
 	// Mappings from source values (inputs) to destination values (outputs).
@@ -109,22 +110,13 @@ func (h *Handler) Validate() error {
 		}
 		seen[input] = i
 
-		// prevent infinite recursion
-		for _, out := range m.Outputs {
-			for _, dest := range h.Destinations {
-				if strings.Contains(caddy.ToString(out), dest) ||
-					strings.Contains(m.Input, dest) {
-					return fmt.Errorf("mapping %d requires value of {%s} to define value of {%s}: infinite recursion", i, dest, dest)
-				}
-			}
-		}
-
 		// ensure mappings have 1:1 output-to-destination correspondence
 		nOut := len(m.Outputs)
 		if nOut != nDest {
 			return fmt.Errorf("mapping %d has %d outputs but there are %d destinations defined", i, nOut, nDest)
 		}
 	}
+
 	return nil
 }
 
@@ -169,7 +161,7 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 
 		// fall back to default if no match or if matched nil value
 		if len(h.Defaults) > destIdx {
-			return h.Defaults[destIdx], true
+			return repl.ReplaceAll(h.Defaults[destIdx], ""), true
 		}
 
 		return nil, true

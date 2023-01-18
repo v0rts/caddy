@@ -117,7 +117,7 @@ func cmdReverseProxy(fs caddycmd.Flags) (int, error) {
 		if err != nil {
 			return caddy.ExitCodeFailedStartup, fmt.Errorf("invalid upstream address %s: %v", toLoc, err)
 		}
-		if scheme != "" && toScheme != "" {
+		if scheme != "" && toScheme == "" {
 			toScheme = scheme
 		}
 		toAddresses[i] = addr
@@ -170,6 +170,10 @@ func cmdReverseProxy(fs caddycmd.Flags) (int, error) {
 	server := &caddyhttp.Server{
 		Routes: caddyhttp.RouteList{route},
 		Listen: []string{":" + fromAddr.Port},
+	}
+
+	if fromAddr.Scheme == "http" {
+		server.AutoHTTPS = &caddyhttp.AutoHTTPSConfig{Disabled: true}
 	}
 
 	httpApp := caddyhttp.App{
