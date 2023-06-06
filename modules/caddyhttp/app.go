@@ -293,9 +293,17 @@ func (app *App) Provision(ctx caddy.Context) error {
 		if srv.Errors != nil {
 			err := srv.Errors.Routes.Provision(ctx)
 			if err != nil {
-				return fmt.Errorf("server %s: setting up server error handling routes: %v", srvName, err)
+				return fmt.Errorf("server %s: setting up error handling routes: %v", srvName, err)
 			}
 			srv.errorHandlerChain = srv.Errors.Routes.Compile(errorEmptyHandler)
+		}
+
+		// provision the named routes (they get compiled at runtime)
+		for name, route := range srv.NamedRoutes {
+			err := route.Provision(ctx, srv.Metrics)
+			if err != nil {
+				return fmt.Errorf("server %s: setting up named route '%s' handlers: %v", name, srvName, err)
+			}
 		}
 
 		// prepare the TLS connection policies
@@ -586,6 +594,21 @@ func (app *App) Stop() error {
 			return
 		}
 
+		// First close h3server then close listeners unlike stdlib for several reasons:
+		// 1, udp has only a single socket, once closed, no more data can be read and
+		// written. In contrast, closing tcp listeners won't affect established connections.
+		// This have something to do with graceful shutdown when upstream implements it.
+		// 2, h3server will only close listeners it's registered (quic listeners). Closing
+		// listener first and these listeners maybe unregistered thus won't be closed. caddy
+		// distinguishes quic-listener and underlying datagram sockets.
+
+		// TODO: CloseGracefully, once implemented upstream (see https://github.com/quic-go/quic-go/issues/2103)
+		if err := server.h3server.Close(); err != nil {
+			app.logger.Error("HTTP/3 server shutdown",
+				zap.Error(err),
+				zap.Strings("addresses", server.Listen))
+		}
+
 		// TODO: we have to manually close our listeners because quic-go won't
 		// close listeners it didn't create along with the server itself...
 		// see https://github.com/quic-go/quic-go/issues/3560
@@ -595,13 +618,6 @@ func (app *App) Stop() error {
 					zap.Error(err),
 					zap.String("address", el.LocalAddr().String()))
 			}
-		}
-
-		// TODO: CloseGracefully, once implemented upstream (see https://github.com/quic-go/quic-go/issues/2103)
-		if err := server.h3server.Close(); err != nil {
-			app.logger.Error("HTTP/3 server shutdown",
-				zap.Error(err),
-				zap.Strings("addresses", server.Listen))
 		}
 	}
 	stopH2Listener := func(server *Server) {

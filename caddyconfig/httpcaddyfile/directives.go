@@ -65,6 +65,7 @@ var directiveOrder = []string{
 	"templates",
 
 	// special routing & dispatching directives
+	"invoke",
 	"handle",
 	"handle_path",
 	"route",
@@ -172,6 +173,7 @@ func (h Helper) Caddyfiles() []string {
 	for file := range files {
 		filesSlice = append(filesSlice, file)
 	}
+	sort.Strings(filesSlice)
 	return filesSlice
 }
 
