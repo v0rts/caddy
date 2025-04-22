@@ -25,10 +25,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/caddyserver/caddy/v2"
-	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/google/cel-go/cel"
 	"github.com/google/cel-go/common"
+	"github.com/google/cel-go/common/ast"
 	"github.com/google/cel-go/common/operators"
 	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/common/types/ref"
@@ -38,7 +37,9 @@ import (
 	"github.com/google/cel-go/interpreter/functions"
 	"github.com/google/cel-go/parser"
 	"go.uber.org/zap"
-	exprpb "google.golang.org/genproto/googleapis/api/expr/v1alpha1"
+
+	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 )
 
 func init() {
@@ -61,11 +62,16 @@ type MatchExpression struct {
 	// The CEL expression to evaluate. Any Caddy placeholders
 	// will be expanded and situated into proper CEL function
 	// calls before evaluating.
-	Expr string
+	Expr string `json:"expr,omitempty"`
+
+	// Name is an optional name for this matcher.
+	// This is used to populate the name for regexp
+	// matchers that appear in the expression.
+	Name string `json:"name,omitempty"`
 
 	expandedExpr string
 	prg          cel.Program
-	ta           ref.TypeAdapter
+	ta           types.Adapter
 
 	log *zap.Logger
 }
@@ -80,12 +86,36 @@ func (MatchExpression) CaddyModule() caddy.ModuleInfo {
 
 // MarshalJSON marshals m's expression.
 func (m MatchExpression) MarshalJSON() ([]byte, error) {
-	return json.Marshal(m.Expr)
+	// if the name is empty, then we can marshal just the expression string
+	if m.Name == "" {
+		return json.Marshal(m.Expr)
+	}
+	// otherwise, we need to marshal the full object, using an
+	// anonymous struct to avoid infinite recursion
+	return json.Marshal(struct {
+		Expr string `json:"expr"`
+		Name string `json:"name"`
+	}{
+		Expr: m.Expr,
+		Name: m.Name,
+	})
 }
 
 // UnmarshalJSON unmarshals m's expression.
 func (m *MatchExpression) UnmarshalJSON(data []byte) error {
-	return json.Unmarshal(data, &m.Expr)
+	// if the data is a string, then it's just the expression
+	if data[0] == '"' {
+		return json.Unmarshal(data, &m.Expr)
+	}
+	// otherwise, it's a full object, so unmarshal it,
+	// using an temp map to avoid infinite recursion
+	var tmpJson map[string]any
+	err := json.Unmarshal(data, &tmpJson)
+	*m = MatchExpression{
+		Expr: tmpJson["expr"].(string),
+		Name: tmpJson["name"].(string),
+	}
+	return err
 }
 
 // Provision sets ups m.
@@ -95,6 +125,10 @@ func (m *MatchExpression) Provision(ctx caddy.Context) error {
 	// replace placeholders with a function call - this is just some
 	// light (and possibly naïve) syntactic sugar
 	m.expandedExpr = placeholderRegexp.ReplaceAllString(m.Expr, placeholderExpansion)
+
+	// as a second pass, we'll strip the escape character from an escaped
+	// placeholder, so that it can be used as an input to other CEL functions
+	m.expandedExpr = escapedPlaceholderRegexp.ReplaceAllString(m.expandedExpr, escapedPlaceholderExpansion)
 
 	// our type adapter expands CEL's standard type support
 	m.ta = celTypeAdapter{}
@@ -108,6 +142,11 @@ func (m *MatchExpression) Provision(ctx caddy.Context) error {
 			matcherLibProducers = append(matcherLibProducers, p)
 		}
 	}
+
+	// add the matcher name to the context so that the matcher name
+	// can be used by regexp matchers being provisioned
+	ctx = ctx.WithValue(MatcherNameCtxKey, m.Name)
+
 	// Assemble the compilation and program options from the different library
 	// producers into a single cel.Library implementation.
 	matcherEnvOpts := []cel.EnvOption{}
@@ -124,14 +163,17 @@ func (m *MatchExpression) Provision(ctx caddy.Context) error {
 
 	// create the CEL environment
 	env, err := cel.NewEnv(
-		cel.Function(placeholderFuncName, cel.SingletonBinaryBinding(m.caddyPlaceholderFunc), cel.Overload(
-			placeholderFuncName+"_httpRequest_string",
+		cel.Function(CELPlaceholderFuncName, cel.SingletonBinaryBinding(m.caddyPlaceholderFunc), cel.Overload(
+			CELPlaceholderFuncName+"_httpRequest_string",
 			[]*cel.Type{httpRequestObjectType, cel.StringType},
 			cel.AnyType,
 		)),
-		cel.Variable("request", httpRequestObjectType),
+		cel.Variable(CELRequestVarName, httpRequestObjectType),
 		cel.CustomTypeAdapter(m.ta),
 		ext.Strings(),
+		ext.Bindings(),
+		ext.Lists(),
+		ext.Math(),
 		matcherLib,
 	)
 	if err != nil {
@@ -160,28 +202,55 @@ func (m *MatchExpression) Provision(ctx caddy.Context) error {
 
 // Match returns true if r matches m.
 func (m MatchExpression) Match(r *http.Request) bool {
+	match, err := m.MatchWithError(r)
+	if err != nil {
+		SetVar(r.Context(), MatcherErrorVarKey, err)
+	}
+	return match
+}
+
+// MatchWithError returns true if r matches m.
+func (m MatchExpression) MatchWithError(r *http.Request) (bool, error) {
 	celReq := celHTTPRequest{r}
 	out, _, err := m.prg.Eval(celReq)
 	if err != nil {
 		m.log.Error("evaluating expression", zap.Error(err))
-		SetVar(r.Context(), MatcherErrorVarKey, err)
-		return false
+		return false, err
 	}
 	if outBool, ok := out.Value().(bool); ok {
-		return outBool
+		return outBool, nil
 	}
-	return false
+	return false, nil
 }
 
 // UnmarshalCaddyfile implements caddyfile.Unmarshaler.
 func (m *MatchExpression) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for d.Next() {
-		if d.CountRemainingArgs() > 1 {
-			m.Expr = strings.Join(d.RemainingArgsRaw(), " ")
-		} else {
-			m.Expr = d.Val()
-		}
+	d.Next() // consume matcher name
+
+	// if there's multiple args, then we need to keep the raw
+	// tokens because the user may have used quotes within their
+	// CEL expression (e.g. strings) and we should retain that
+	if d.CountRemainingArgs() > 1 {
+		m.Expr = strings.Join(d.RemainingArgsRaw(), " ")
+		return nil
 	}
+
+	// there should at least be one arg
+	if !d.NextArg() {
+		return d.ArgErr()
+	}
+
+	// if there's only one token, then we can safely grab the
+	// cleaned token (no quotes) and use that as the expression
+	// because there's no valid CEL expression that is only a
+	// quoted string; commonly quotes are used in Caddyfile to
+	// define the expression
+	m.Expr = d.Val()
+
+	// use the named matcher's name, to fill regexp
+	// matchers names by default
+	m.Name = d.GetContextString(caddyfile.MatcherNameCtxKey)
+
 	return nil
 }
 
@@ -193,7 +262,7 @@ func (m MatchExpression) caddyPlaceholderFunc(lhs, rhs ref.Val) ref.Val {
 		return types.NewErr(
 			"invalid request of type '%v' to %s(request, placeholderVarName)",
 			lhs.Type(),
-			placeholderFuncName,
+			CELPlaceholderFuncName,
 		)
 	}
 	phStr, ok := rhs.(types.String)
@@ -201,7 +270,7 @@ func (m MatchExpression) caddyPlaceholderFunc(lhs, rhs ref.Val) ref.Val {
 		return types.NewErr(
 			"invalid placeholder variable name of type '%v' to %s(request, placeholderVarName)",
 			rhs.Type(),
-			placeholderFuncName,
+			CELPlaceholderFuncName,
 		)
 	}
 
@@ -212,7 +281,7 @@ func (m MatchExpression) caddyPlaceholderFunc(lhs, rhs ref.Val) ref.Val {
 }
 
 // httpRequestCELType is the type representation of a native HTTP request.
-var httpRequestCELType = types.NewTypeValue("http.Request", traits.ReceiverType)
+var httpRequestCELType = cel.ObjectType("http.Request", traits.ReceiverType)
 
 // celHTTPRequest wraps an http.Request with ref.Val interface methods.
 //
@@ -221,7 +290,7 @@ var httpRequestCELType = types.NewTypeValue("http.Request", traits.ReceiverType)
 type celHTTPRequest struct{ *http.Request }
 
 func (cr celHTTPRequest) ResolveName(name string) (any, bool) {
-	if name == "request" {
+	if name == CELRequestVarName {
 		return cr, true
 	}
 	return nil, false
@@ -234,9 +303,11 @@ func (cr celHTTPRequest) Parent() interpreter.Activation {
 func (cr celHTTPRequest) ConvertToNative(typeDesc reflect.Type) (any, error) {
 	return cr.Request, nil
 }
+
 func (celHTTPRequest) ConvertToType(typeVal ref.Type) ref.Val {
 	panic("not implemented")
 }
+
 func (cr celHTTPRequest) Equal(other ref.Val) ref.Val {
 	if o, ok := other.Value().(celHTTPRequest); ok {
 		return types.Bool(o.Request == cr.Request)
@@ -246,7 +317,7 @@ func (cr celHTTPRequest) Equal(other ref.Val) ref.Val {
 func (celHTTPRequest) Type() ref.Type { return httpRequestCELType }
 func (cr celHTTPRequest) Value() any  { return cr }
 
-var pkixNameCELType = types.NewTypeValue("pkix.Name", traits.ReceiverType)
+var pkixNameCELType = cel.ObjectType("pkix.Name", traits.ReceiverType)
 
 // celPkixName wraps an pkix.Name with
 // methods to satisfy the ref.Val interface.
@@ -255,12 +326,14 @@ type celPkixName struct{ *pkix.Name }
 func (pn celPkixName) ConvertToNative(typeDesc reflect.Type) (any, error) {
 	return pn.Name, nil
 }
+
 func (pn celPkixName) ConvertToType(typeVal ref.Type) ref.Val {
 	if typeVal.TypeName() == "string" {
 		return types.String(pn.Name.String())
 	}
 	panic("not implemented")
 }
+
 func (pn celPkixName) Equal(other ref.Val) ref.Val {
 	if o, ok := other.Value().(string); ok {
 		return types.Bool(pn.Name.String() == o)
@@ -282,7 +355,7 @@ func (celTypeAdapter) NativeToValue(value any) ref.Val {
 	case time.Time:
 		return types.Timestamp{Time: v}
 	case error:
-		types.NewErr(v.Error())
+		return types.WrapErr(v)
 	}
 	return types.DefaultTypeAdapter.NativeToValue(value)
 }
@@ -315,7 +388,7 @@ type CELLibraryProducer interface {
 // limited set of function signatures. For strong type validation you may need
 // to provide a custom macro which does a more detailed analysis of the CEL
 // literal provided to the macro as an argument.
-func CELMatcherImpl(macroName, funcName string, matcherDataTypes []*cel.Type, fac CELMatcherFactory) (cel.Library, error) {
+func CELMatcherImpl(macroName, funcName string, matcherDataTypes []*cel.Type, fac any) (cel.Library, error) {
 	requestType := cel.ObjectType("http.Request")
 	var macro parser.Macro
 	switch len(matcherDataTypes) {
@@ -359,27 +432,31 @@ func CELMatcherImpl(macroName, funcName string, matcherDataTypes []*cel.Type, fa
 }
 
 // CELMatcherFactory converts a constant CEL value into a RequestMatcher.
-type CELMatcherFactory func(data ref.Val) (RequestMatcher, error)
+// Deprecated: Use CELMatcherWithErrorFactory instead.
+type CELMatcherFactory = func(data ref.Val) (RequestMatcher, error)
+
+// CELMatcherWithErrorFactory converts a constant CEL value into a RequestMatcherWithError.
+type CELMatcherWithErrorFactory = func(data ref.Val) (RequestMatcherWithError, error)
 
 // matcherCELLibrary is a simplistic configurable cel.Library implementation.
-type matcherCELLibary struct {
+type matcherCELLibrary struct {
 	envOptions     []cel.EnvOption
 	programOptions []cel.ProgramOption
 }
 
 // NewMatcherCELLibrary creates a matcherLibrary from option setes.
 func NewMatcherCELLibrary(envOptions []cel.EnvOption, programOptions []cel.ProgramOption) cel.Library {
-	return &matcherCELLibary{
+	return &matcherCELLibrary{
 		envOptions:     envOptions,
 		programOptions: programOptions,
 	}
 }
 
-func (lib *matcherCELLibary) CompileOptions() []cel.EnvOption {
+func (lib *matcherCELLibrary) CompileOptions() []cel.EnvOption {
 	return lib.envOptions
 }
 
-func (lib *matcherCELLibary) ProgramOptions() []cel.ProgramOption {
+func (lib *matcherCELLibrary) ProgramOptions() []cel.ProgramOption {
 	return lib.programOptions
 }
 
@@ -387,7 +464,7 @@ func (lib *matcherCELLibary) ProgramOptions() []cel.ProgramOption {
 // that takes a single argument, and optimizes the implementation to precompile
 // the matcher and return a function that references the precompiled and
 // provisioned matcher.
-func CELMatcherDecorator(funcName string, fac CELMatcherFactory) interpreter.InterpretableDecorator {
+func CELMatcherDecorator(funcName string, fac any) interpreter.InterpretableDecorator {
 	return func(i interpreter.Interpretable) (interpreter.Interpretable, error) {
 		call, ok := i.(interpreter.InterpretableCall)
 		if !ok {
@@ -399,15 +476,15 @@ func CELMatcherDecorator(funcName string, fac CELMatcherFactory) interpreter.Int
 		callArgs := call.Args()
 		reqAttr, ok := callArgs[0].(interpreter.InterpretableAttribute)
 		if !ok {
-			return nil, errors.New("missing 'request' argument")
+			return nil, errors.New("missing 'req' argument")
 		}
 		nsAttr, ok := reqAttr.Attr().(interpreter.NamespacedAttribute)
 		if !ok {
-			return nil, errors.New("missing 'request' argument")
+			return nil, errors.New("missing 'req' argument")
 		}
 		varNames := nsAttr.CandidateVariableNames()
-		if len(varNames) != 1 || len(varNames) == 1 && varNames[0] != "request" {
-			return nil, errors.New("missing 'request' argument")
+		if len(varNames) != 1 || len(varNames) == 1 && varNames[0] != CELRequestVarName {
+			return nil, errors.New("missing 'req' argument")
 		}
 		matcherData, ok := callArgs[1].(interpreter.InterpretableConst)
 		if !ok {
@@ -416,35 +493,92 @@ func CELMatcherDecorator(funcName string, fac CELMatcherFactory) interpreter.Int
 			// and matcher provisioning should be handled at dynamically.
 			return i, nil
 		}
-		matcher, err := fac(matcherData.Value())
-		if err != nil {
-			return nil, err
+
+		if factory, ok := fac.(CELMatcherWithErrorFactory); ok {
+			matcher, err := factory(matcherData.Value())
+			if err != nil {
+				return nil, err
+			}
+			return interpreter.NewCall(
+				i.ID(), funcName, funcName+"_opt",
+				[]interpreter.Interpretable{reqAttr},
+				func(args ...ref.Val) ref.Val {
+					// The request value, guaranteed to be of type celHTTPRequest
+					celReq := args[0]
+					// If needed this call could be changed to convert the value
+					// to a *http.Request using CEL's ConvertToNative method.
+					httpReq := celReq.Value().(celHTTPRequest)
+					match, err := matcher.MatchWithError(httpReq.Request)
+					if err != nil {
+						return types.WrapErr(err)
+					}
+					return types.Bool(match)
+				},
+			), nil
 		}
-		return interpreter.NewCall(
-			i.ID(), funcName, funcName+"_opt",
-			[]interpreter.Interpretable{reqAttr},
-			func(args ...ref.Val) ref.Val {
-				// The request value, guaranteed to be of type celHTTPRequest
-				celReq := args[0]
-				// If needed this call could be changed to convert the value
-				// to a *http.Request using CEL's ConvertToNative method.
-				httpReq := celReq.Value().(celHTTPRequest)
-				return types.Bool(matcher.Match(httpReq.Request))
-			},
-		), nil
+
+		if factory, ok := fac.(CELMatcherFactory); ok {
+			matcher, err := factory(matcherData.Value())
+			if err != nil {
+				return nil, err
+			}
+			return interpreter.NewCall(
+				i.ID(), funcName, funcName+"_opt",
+				[]interpreter.Interpretable{reqAttr},
+				func(args ...ref.Val) ref.Val {
+					// The request value, guaranteed to be of type celHTTPRequest
+					celReq := args[0]
+					// If needed this call could be changed to convert the value
+					// to a *http.Request using CEL's ConvertToNative method.
+					httpReq := celReq.Value().(celHTTPRequest)
+					if m, ok := matcher.(RequestMatcherWithError); ok {
+						match, err := m.MatchWithError(httpReq.Request)
+						if err != nil {
+							return types.WrapErr(err)
+						}
+						return types.Bool(match)
+					}
+					return types.Bool(matcher.Match(httpReq.Request))
+				},
+			), nil
+		}
+
+		return nil, fmt.Errorf("invalid matcher factory, must be CELMatcherFactory or CELMatcherWithErrorFactory: %T", fac)
 	}
 }
 
 // CELMatcherRuntimeFunction creates a function binding for when the input to the matcher
 // is dynamically resolved rather than a set of static constant values.
-func CELMatcherRuntimeFunction(funcName string, fac CELMatcherFactory) functions.BinaryOp {
+func CELMatcherRuntimeFunction(funcName string, fac any) functions.BinaryOp {
 	return func(celReq, matcherData ref.Val) ref.Val {
-		matcher, err := fac(matcherData)
-		if err != nil {
-			return types.NewErr(err.Error())
+		if factory, ok := fac.(CELMatcherWithErrorFactory); ok {
+			matcher, err := factory(matcherData)
+			if err != nil {
+				return types.WrapErr(err)
+			}
+			httpReq := celReq.Value().(celHTTPRequest)
+			match, err := matcher.MatchWithError(httpReq.Request)
+			if err != nil {
+				return types.WrapErr(err)
+			}
+			return types.Bool(match)
 		}
-		httpReq := celReq.Value().(celHTTPRequest)
-		return types.Bool(matcher.Match(httpReq.Request))
+		if factory, ok := fac.(CELMatcherFactory); ok {
+			matcher, err := factory(matcherData)
+			if err != nil {
+				return types.WrapErr(err)
+			}
+			httpReq := celReq.Value().(celHTTPRequest)
+			if m, ok := matcher.(RequestMatcherWithError); ok {
+				match, err := m.MatchWithError(httpReq.Request)
+				if err != nil {
+					return types.WrapErr(err)
+				}
+				return types.Bool(match)
+			}
+			return types.Bool(matcher.Match(httpReq.Request))
+		}
+		return types.NewErr("CELMatcherRuntimeFunction invalid matcher factory: %T", fac)
 	}
 }
 
@@ -453,25 +587,20 @@ func CELMatcherRuntimeFunction(funcName string, fac CELMatcherFactory) functions
 //
 // The arguments are collected into a single list argument the following
 // function call returned: <funcName>(request, [args])
-func celMatcherStringListMacroExpander(funcName string) parser.MacroExpander {
-	return func(eh parser.ExprHelper, target *exprpb.Expr, args []*exprpb.Expr) (*exprpb.Expr, *common.Error) {
-		matchArgs := []*exprpb.Expr{}
+func celMatcherStringListMacroExpander(funcName string) cel.MacroFactory {
+	return func(eh cel.MacroExprFactory, target ast.Expr, args []ast.Expr) (ast.Expr, *common.Error) {
+		matchArgs := []ast.Expr{}
 		if len(args) == 0 {
-			return nil, &common.Error{
-				Message: "matcher requires at least one argument",
-			}
+			return nil, eh.NewError(0, "matcher requires at least one argument")
 		}
 		for _, arg := range args {
 			if isCELStringExpr(arg) {
 				matchArgs = append(matchArgs, arg)
 			} else {
-				return nil, &common.Error{
-					Location: eh.OffsetLocation(arg.GetId()),
-					Message:  "matcher arguments must be string constants",
-				}
+				return nil, eh.NewError(arg.ID(), "matcher arguments must be string constants")
 			}
 		}
-		return eh.GlobalCall(funcName, eh.Ident("request"), eh.NewList(matchArgs...)), nil
+		return eh.NewCall(funcName, eh.NewIdent(CELRequestVarName), eh.NewList(matchArgs...)), nil
 	}
 }
 
@@ -480,19 +609,14 @@ func celMatcherStringListMacroExpander(funcName string) parser.MacroExpander {
 //
 // The following function call is returned: <funcName>(request, arg)
 func celMatcherStringMacroExpander(funcName string) parser.MacroExpander {
-	return func(eh parser.ExprHelper, target *exprpb.Expr, args []*exprpb.Expr) (*exprpb.Expr, *common.Error) {
+	return func(eh cel.MacroExprFactory, target ast.Expr, args []ast.Expr) (ast.Expr, *common.Error) {
 		if len(args) != 1 {
-			return nil, &common.Error{
-				Message: "matcher requires one argument",
-			}
+			return nil, eh.NewError(0, "matcher requires one argument")
 		}
 		if isCELStringExpr(args[0]) {
-			return eh.GlobalCall(funcName, eh.Ident("request"), args[0]), nil
+			return eh.NewCall(funcName, eh.NewIdent(CELRequestVarName), args[0]), nil
 		}
-		return nil, &common.Error{
-			Location: eh.OffsetLocation(args[0].GetId()),
-			Message:  "matcher argument must be a string literal",
-		}
+		return nil, eh.NewError(args[0].ID(), "matcher argument must be a string literal")
 	}
 }
 
@@ -501,49 +625,35 @@ func celMatcherStringMacroExpander(funcName string) parser.MacroExpander {
 //
 // The following function call is returned: <funcName>(request, arg)
 func celMatcherJSONMacroExpander(funcName string) parser.MacroExpander {
-	return func(eh parser.ExprHelper, target *exprpb.Expr, args []*exprpb.Expr) (*exprpb.Expr, *common.Error) {
+	return func(eh cel.MacroExprFactory, target ast.Expr, args []ast.Expr) (ast.Expr, *common.Error) {
 		if len(args) != 1 {
-			return nil, &common.Error{
-				Message: "matcher requires a map literal argument",
-			}
+			return nil, eh.NewError(0, "matcher requires a map literal argument")
 		}
 		arg := args[0]
-		switch arg.GetExprKind().(type) {
-		case *exprpb.Expr_StructExpr:
-			structExpr := arg.GetStructExpr()
-			if structExpr.GetMessageName() != "" {
-				return nil, &common.Error{
-					Location: eh.OffsetLocation(arg.GetId()),
-					Message: fmt.Sprintf(
-						"matcher input must be a map literal, not a %s",
-						structExpr.GetMessageName(),
-					),
-				}
-			}
-			for _, entry := range structExpr.GetEntries() {
-				isStringPlaceholder := isCELStringExpr(entry.GetMapKey())
+
+		switch arg.Kind() {
+		case ast.StructKind:
+			return nil, eh.NewError(arg.ID(),
+				fmt.Sprintf("matcher input must be a map literal, not a %s", arg.AsStruct().TypeName()))
+		case ast.MapKind:
+			mapExpr := arg.AsMap()
+			for _, entry := range mapExpr.Entries() {
+				isStringPlaceholder := isCELStringExpr(entry.AsMapEntry().Key())
 				if !isStringPlaceholder {
-					return nil, &common.Error{
-						Location: eh.OffsetLocation(entry.GetId()),
-						Message:  "matcher map keys must be string literals",
-					}
+					return nil, eh.NewError(entry.ID(), "matcher map keys must be string literals")
 				}
-				isStringListPlaceholder := isCELStringExpr(entry.GetValue()) ||
-					isCELStringListLiteral(entry.GetValue())
+				isStringListPlaceholder := isCELStringExpr(entry.AsMapEntry().Value()) ||
+					isCELStringListLiteral(entry.AsMapEntry().Value())
 				if !isStringListPlaceholder {
-					return nil, &common.Error{
-						Location: eh.OffsetLocation(entry.GetValue().GetId()),
-						Message:  "matcher map values must be string or list literals",
-					}
+					return nil, eh.NewError(entry.AsMapEntry().Value().ID(), "matcher map values must be string or list literals")
 				}
 			}
-			return eh.GlobalCall(funcName, eh.Ident("request"), arg), nil
+			return eh.NewCall(funcName, eh.NewIdent(CELRequestVarName), arg), nil
+		case ast.UnspecifiedExprKind, ast.CallKind, ast.ComprehensionKind, ast.IdentKind, ast.ListKind, ast.LiteralKind, ast.SelectKind:
+			// appeasing the linter :)
 		}
 
-		return nil, &common.Error{
-			Location: eh.OffsetLocation(arg.GetId()),
-			Message:  "matcher requires a map literal argument",
-		}
+		return nil, eh.NewError(arg.ID(), "matcher requires a map literal argument")
 	}
 }
 
@@ -588,69 +698,77 @@ func CELValueToMapStrList(data ref.Val) (map[string][]string, error) {
 }
 
 // isCELStringExpr indicates whether the expression is a supported string expression
-func isCELStringExpr(e *exprpb.Expr) bool {
+func isCELStringExpr(e ast.Expr) bool {
 	return isCELStringLiteral(e) || isCELCaddyPlaceholderCall(e) || isCELConcatCall(e)
 }
 
 // isCELStringLiteral returns whether the expression is a CEL string literal.
-func isCELStringLiteral(e *exprpb.Expr) bool {
-	switch e.GetExprKind().(type) {
-	case *exprpb.Expr_ConstExpr:
-		constant := e.GetConstExpr()
-		switch constant.GetConstantKind().(type) {
-		case *exprpb.Constant_StringValue:
+func isCELStringLiteral(e ast.Expr) bool {
+	switch e.Kind() {
+	case ast.LiteralKind:
+		constant := e.AsLiteral()
+		switch constant.Type() {
+		case types.StringType:
 			return true
 		}
+	case ast.UnspecifiedExprKind, ast.CallKind, ast.ComprehensionKind, ast.IdentKind, ast.ListKind, ast.MapKind, ast.SelectKind, ast.StructKind:
+		// appeasing the linter :)
 	}
 	return false
 }
 
 // isCELCaddyPlaceholderCall returns whether the expression is a caddy placeholder call.
-func isCELCaddyPlaceholderCall(e *exprpb.Expr) bool {
-	switch e.GetExprKind().(type) {
-	case *exprpb.Expr_CallExpr:
-		call := e.GetCallExpr()
-		if call.GetFunction() == "caddyPlaceholder" {
+func isCELCaddyPlaceholderCall(e ast.Expr) bool {
+	switch e.Kind() {
+	case ast.CallKind:
+		call := e.AsCall()
+		if call.FunctionName() == CELPlaceholderFuncName {
 			return true
 		}
+	case ast.UnspecifiedExprKind, ast.ComprehensionKind, ast.IdentKind, ast.ListKind, ast.LiteralKind, ast.MapKind, ast.SelectKind, ast.StructKind:
+		// appeasing the linter :)
 	}
 	return false
 }
 
 // isCELConcatCall tests whether the expression is a concat function (+) with string, placeholder, or
 // other concat call arguments.
-func isCELConcatCall(e *exprpb.Expr) bool {
-	switch e.GetExprKind().(type) {
-	case *exprpb.Expr_CallExpr:
-		call := e.GetCallExpr()
-		if call.GetTarget() != nil {
+func isCELConcatCall(e ast.Expr) bool {
+	switch e.Kind() {
+	case ast.CallKind:
+		call := e.AsCall()
+		if call.Target().Kind() != ast.UnspecifiedExprKind {
 			return false
 		}
-		if call.GetFunction() != operators.Add {
+		if call.FunctionName() != operators.Add {
 			return false
 		}
-		for _, arg := range call.GetArgs() {
+		for _, arg := range call.Args() {
 			if !isCELStringExpr(arg) {
 				return false
 			}
 		}
 		return true
+	case ast.UnspecifiedExprKind, ast.ComprehensionKind, ast.IdentKind, ast.ListKind, ast.LiteralKind, ast.MapKind, ast.SelectKind, ast.StructKind:
+		// appeasing the linter :)
 	}
 	return false
 }
 
 // isCELStringListLiteral returns whether the expression resolves to a list literal
 // containing only string constants or a placeholder call.
-func isCELStringListLiteral(e *exprpb.Expr) bool {
-	switch e.GetExprKind().(type) {
-	case *exprpb.Expr_ListExpr:
-		list := e.GetListExpr()
-		for _, elem := range list.GetElements() {
+func isCELStringListLiteral(e ast.Expr) bool {
+	switch e.Kind() {
+	case ast.ListKind:
+		list := e.AsList()
+		for _, elem := range list.Elements() {
 			if !isCELStringExpr(elem) {
 				return false
 			}
 		}
 		return true
+	case ast.UnspecifiedExprKind, ast.CallKind, ast.ComprehensionKind, ast.IdentKind, ast.LiteralKind, ast.MapKind, ast.SelectKind, ast.StructKind:
+		// appeasing the linter :)
 	}
 	return false
 }
@@ -659,8 +777,15 @@ func isCELStringListLiteral(e *exprpb.Expr) bool {
 // expressions with a proper CEL function call; this is
 // just for syntactic sugar.
 var (
-	placeholderRegexp    = regexp.MustCompile(`{([a-zA-Z][\w.-]+)}`)
-	placeholderExpansion = `caddyPlaceholder(request, "${1}")`
+	// The placeholder may not be preceded by a backslash; the expansion
+	// will include the preceding character if it is not a backslash.
+	placeholderRegexp    = regexp.MustCompile(`([^\\]|^){([a-zA-Z][\w.-]+)}`)
+	placeholderExpansion = `${1}ph(req, "${2}")`
+
+	// As a second pass, we need to strip the escape character in front of
+	// the placeholder, if it exists.
+	escapedPlaceholderRegexp    = regexp.MustCompile(`\\{([a-zA-Z][\w.-]+)}`)
+	escapedPlaceholderExpansion = `{${1}}`
 
 	CELTypeJSON = cel.MapType(cel.StringType, cel.DynType)
 )
@@ -668,13 +793,18 @@ var (
 var httpRequestObjectType = cel.ObjectType("http.Request")
 
 // The name of the CEL function which accesses Replacer values.
-const placeholderFuncName = "caddyPlaceholder"
+const CELPlaceholderFuncName = "ph"
+
+// The name of the CEL request variable.
+const CELRequestVarName = "req"
+
+const MatcherNameCtxKey = "matcher_name"
 
 // Interface guards
 var (
-	_ caddy.Provisioner     = (*MatchExpression)(nil)
-	_ RequestMatcher        = (*MatchExpression)(nil)
-	_ caddyfile.Unmarshaler = (*MatchExpression)(nil)
-	_ json.Marshaler        = (*MatchExpression)(nil)
-	_ json.Unmarshaler      = (*MatchExpression)(nil)
+	_ caddy.Provisioner       = (*MatchExpression)(nil)
+	_ RequestMatcherWithError = (*MatchExpression)(nil)
+	_ caddyfile.Unmarshaler   = (*MatchExpression)(nil)
+	_ json.Marshaler          = (*MatchExpression)(nil)
+	_ json.Unmarshaler        = (*MatchExpression)(nil)
 )

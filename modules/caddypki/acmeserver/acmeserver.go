@@ -26,10 +26,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/caddyserver/caddy/v2"
-	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-	"github.com/caddyserver/caddy/v2/modules/caddypki"
-	"github.com/go-chi/chi"
+	"github.com/go-chi/chi/v5"
 	"github.com/smallstep/certificates/acme"
 	"github.com/smallstep/certificates/acme/api"
 	acmeNoSQL "github.com/smallstep/certificates/acme/db/nosql"
@@ -38,6 +35,11 @@ import (
 	"github.com/smallstep/certificates/db"
 	"github.com/smallstep/nosql"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+
+	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/caddyserver/caddy/v2/modules/caddypki"
 )
 
 func init() {
@@ -90,6 +92,14 @@ type Handler struct {
 	// than 1 resolver address, one is chosen at random.
 	Resolvers []string `json:"resolvers,omitempty"`
 
+	// Specify the set of enabled ACME challenges. An empty or absent value
+	// means all challenges are enabled. Accepted values are:
+	// "http-01", "dns-01", "tls-alpn-01"
+	Challenges ACMEChallenges `json:"challenges,omitempty" `
+
+	// The policy to use for issuing certificates
+	Policy *Policy `json:"policy,omitempty"`
+
 	logger    *zap.Logger
 	resolvers []caddy.NetworkAddress
 	ctx       caddy.Context
@@ -124,6 +134,11 @@ func (ash *Handler) Provision(ctx caddy.Context) error {
 	if ash.Lifetime == 0 {
 		ash.Lifetime = caddy.Duration(12 * time.Hour)
 	}
+	if len(ash.Challenges) > 0 {
+		if err := ash.Challenges.validate(); err != nil {
+			return err
+		}
+	}
 
 	// get a reference to the configured CA
 	appModule, err := ctx.App("pki")
@@ -152,7 +167,11 @@ func (ash *Handler) Provision(ctx caddy.Context) error {
 		AuthConfig: &authority.AuthConfig{
 			Provisioners: provisioner.List{
 				&provisioner.ACME{
-					Name: ash.CA,
+					Name:       ash.CA,
+					Challenges: ash.Challenges.toSmallstepType(),
+					Options: &provisioner.Options{
+						X509: ash.Policy.normalizeRules(),
+					},
 					Type: provisioner.TypeACME.String(),
 					Claims: &provisioner.Claims{
 						MinTLSDur:     &provisioner.Duration{Duration: 5 * time.Minute},
@@ -225,10 +244,14 @@ func (ash Handler) Cleanup() error {
 	key := ash.getDatabaseKey()
 	deleted, err := databasePool.Delete(key)
 	if deleted {
-		ash.logger.Debug("unloading unused CA database", zap.String("db_key", key))
+		if c := ash.logger.Check(zapcore.DebugLevel, "unloading unused CA database"); c != nil {
+			c.Write(zap.String("db_key", key))
+		}
 	}
 	if err != nil {
-		ash.logger.Error("closing CA database", zap.String("db_key", key), zap.Error(err))
+		if c := ash.logger.Check(zapcore.ErrorLevel, "closing CA database"); c != nil {
+			c.Write(zap.String("db_key", key), zap.Error(err))
+		}
 	}
 	return err
 }
@@ -239,7 +262,7 @@ func (ash Handler) openDatabase() (*db.AuthDB, error) {
 		dbFolder := filepath.Join(caddy.AppDataDir(), "acme_server", key)
 		dbPath := filepath.Join(dbFolder, "db")
 
-		err := os.MkdirAll(dbFolder, 0755)
+		err := os.MkdirAll(dbFolder, 0o755)
 		if err != nil {
 			return nil, fmt.Errorf("making folder for CA database: %v", err)
 		}
@@ -253,7 +276,9 @@ func (ash Handler) openDatabase() (*db.AuthDB, error) {
 	})
 
 	if loaded {
-		ash.logger.Debug("loaded preexisting CA database", zap.String("db_key", key))
+		if c := ash.logger.Check(zapcore.DebugLevel, "loaded preexisting CA database"); c != nil {
+			c.Write(zap.String("db_key", key))
+		}
 	}
 
 	return database.(databaseCloser).DB, err
@@ -310,8 +335,10 @@ func (c resolverClient) LookupTxt(name string) ([]string, error) {
 
 const defaultPathPrefix = "/acme/"
 
-var keyCleaner = regexp.MustCompile(`[^\w.-_]`)
-var databasePool = caddy.NewUsagePool()
+var (
+	keyCleaner   = regexp.MustCompile(`[^\w.-_]`)
+	databasePool = caddy.NewUsagePool()
+)
 
 type databaseCloser struct {
 	DB *db.AuthDB

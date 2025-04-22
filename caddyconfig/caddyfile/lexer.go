@@ -137,18 +137,32 @@ func (l *lexer) next() (bool, error) {
 		}
 
 		// detect whether we have the start of a heredoc
-		if !inHeredoc && !heredocEscaped && len(val) > 1 && string(val[:2]) == "<<" {
-			if ch == '<' {
-				return false, fmt.Errorf("too many '<' for heredoc on line #%d; only use two, for example <<END", l.line)
+		if !(quoted || btQuoted) && !(inHeredoc || heredocEscaped) &&
+			len(val) > 1 && string(val[:2]) == "<<" {
+			// a space means it's just a regular token and not a heredoc
+			if ch == ' ' {
+				return makeToken(0), nil
 			}
+
+			// skip CR, we only care about LF
 			if ch == '\r' {
 				continue
 			}
+
 			// after hitting a newline, we know that the heredoc marker
 			// is the characters after the two << and the newline.
 			// we reset the val because the heredoc is syntax we don't
 			// want to keep.
 			if ch == '\n' {
+				if len(val) == 2 {
+					return false, fmt.Errorf("missing opening heredoc marker on line #%d; must contain only alpha-numeric characters, dashes and underscores; got empty string", l.line)
+				}
+
+				// check if there's too many <
+				if string(val[:3]) == "<<<" {
+					return false, fmt.Errorf("too many '<' for heredoc on line #%d; only use two, for example <<END", l.line)
+				}
+
 				heredocMarker = string(val[2:])
 				if !heredocMarkerRegexp.Match([]byte(heredocMarker)) {
 					return false, fmt.Errorf("heredoc marker on line #%d must contain only alpha-numeric characters, dashes and underscores; got '%s'", l.line, heredocMarker)
@@ -172,7 +186,7 @@ func (l *lexer) next() (bool, error) {
 			}
 
 			// check if we're done, i.e. that the last few characters are the marker
-			if len(val) > len(heredocMarker) && heredocMarker == string(val[len(val)-len(heredocMarker):]) {
+			if len(val) >= len(heredocMarker) && heredocMarker == string(val[len(val)-len(heredocMarker):]) {
 				// set the final value
 				val, err = l.finalizeHeredoc(val, heredocMarker)
 				if err != nil {
@@ -299,6 +313,11 @@ func (l *lexer) finalizeHeredoc(val []rune, marker string) ([]rune, error) {
 	// iterate over each line and strip the whitespace from the front
 	var out string
 	for lineNum, lineText := range lines[:len(lines)-1] {
+		if lineText == "" || lineText == "\r" {
+			out += "\n"
+			continue
+		}
+
 		// find an exact match for the padding
 		index := strings.Index(lineText, paddingToStrip)
 
@@ -321,6 +340,8 @@ func (l *lexer) finalizeHeredoc(val []rune, marker string) ([]rune, error) {
 	return []rune(out), nil
 }
 
+// Quoted returns true if the token was enclosed in quotes
+// (i.e. double quotes, backticks, or heredoc).
 func (t Token) Quoted() bool {
 	return t.wasQuoted > 0
 }
@@ -337,4 +358,42 @@ func (t Token) NumLineBreaks() int {
 	return lineBreaks
 }
 
+// Clone returns a deep copy of the token.
+func (t Token) Clone() Token {
+	return Token{
+		File:          t.File,
+		imports:       append([]string{}, t.imports...),
+		Line:          t.Line,
+		Text:          t.Text,
+		wasQuoted:     t.wasQuoted,
+		heredocMarker: t.heredocMarker,
+		snippetName:   t.snippetName,
+	}
+}
+
 var heredocMarkerRegexp = regexp.MustCompile("^[A-Za-z0-9_-]+$")
+
+// isNextOnNewLine tests whether t2 is on a different line from t1
+func isNextOnNewLine(t1, t2 Token) bool {
+	// If the second token is from a different file,
+	// we can assume it's from a different line
+	if t1.File != t2.File {
+		return true
+	}
+
+	// If the second token is from a different import chain,
+	// we can assume it's from a different line
+	if len(t1.imports) != len(t2.imports) {
+		return true
+	}
+	for i, im := range t1.imports {
+		if im != t2.imports[i] {
+			return true
+		}
+	}
+
+	// If the first token (incl line breaks) ends
+	// on a line earlier than the next token,
+	// then the second token is on a new line
+	return t1.Line+t1.NumLineBreaks() < t2.Line
+}

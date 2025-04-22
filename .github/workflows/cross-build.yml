@@ -10,28 +10,43 @@ on:
       - master
       - 2.*
 
+env:
+  # https://github.com/actions/setup-go/issues/491
+  GOTOOLCHAIN: local
+
 jobs:
-  cross-build-test:
+  build:
     strategy:
       fail-fast: false
       matrix:
-        goos: ['android', 'linux', 'solaris', 'illumos', 'dragonfly', 'freebsd', 'openbsd', 'plan9', 'windows', 'darwin', 'netbsd']
-        go: [ '1.20' ]
+        goos:
+          - 'aix'
+          - 'linux'
+          - 'solaris'
+          - 'illumos'
+          - 'dragonfly'
+          - 'freebsd'
+          - 'openbsd'
+          - 'windows'
+          - 'darwin'
+          - 'netbsd'
+        go:
+          - '1.24'
 
         include:
         # Set the minimum Go patch version for the given Go minor
         # Usable via ${{ matrix.GO_SEMVER }}
-        - go: '1.20'
-          GO_SEMVER: '~1.20.1'
+        - go: '1.24'
+          GO_SEMVER: '~1.24.1'
 
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.GO_SEMVER }}
           check-latest: true
@@ -50,12 +65,9 @@ jobs:
         env:
           CGO_ENABLED: 0
           GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goos == 'aix' && 'ppc64' || 'amd64' }}
         shell: bash
         continue-on-error: true
         working-directory: ./cmd/caddy
         run: |
-          GOOS=$GOOS go build -trimpath -o caddy-"$GOOS"-amd64 2> /dev/null
-          if [ $? -ne 0 ]; then
-            echo "::warning ::$GOOS Build Failed"
-            exit 0
-          fi
+          GOOS=$GOOS GOARCH=$GOARCH go build -tags=nobadger,nomysql,nopgx -trimpath -o caddy-"$GOOS"-$GOARCH 2> /dev/null

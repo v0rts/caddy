@@ -22,9 +22,10 @@ import (
 	"strconv"
 	"strings"
 
+	"go.uber.org/zap"
+
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-	"go.uber.org/zap"
 )
 
 func init() {
@@ -88,6 +89,9 @@ type Rewrite struct {
 	// Performs regular expression replacements on the URI path.
 	PathRegexp []*regexReplacer `json:"path_regexp,omitempty"`
 
+	// Mutates the query string of the URI.
+	Query *queryOps `json:"query,omitempty"`
+
 	logger *zap.Logger
 }
 
@@ -113,21 +117,33 @@ func (rewr *Rewrite) Provision(ctx caddy.Context) error {
 		}
 		rep.re = re
 	}
+	if rewr.Query != nil {
+		for _, replacementOp := range rewr.Query.Replace {
+			err := replacementOp.Provision(ctx)
+			if err != nil {
+				return fmt.Errorf("compiling regular expression %s in query rewrite replace operation: %v", replacementOp.SearchRegexp, err)
+			}
+		}
+	}
 
 	return nil
 }
 
 func (rewr Rewrite) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	const message = "rewrote request"
 
-	logger := rewr.logger.With(
-		zap.Object("request", caddyhttp.LoggableHTTPRequest{Request: r}),
-	)
+	c := rewr.logger.Check(zap.DebugLevel, message)
+	if c == nil {
+		rewr.Rewrite(r, repl)
+		return next.ServeHTTP(w, r)
+	}
 
 	changed := rewr.Rewrite(r, repl)
 
 	if changed {
-		logger.Debug("rewrote request",
+		c.Write(
+			zap.Object("request", caddyhttp.LoggableHTTPRequest{Request: r}),
 			zap.String("method", r.Method),
 			zap.String("uri", r.RequestURI),
 		)
@@ -243,6 +259,9 @@ func (rewr Rewrite) Rewrite(r *http.Request, repl *caddy.Replacer) bool {
 	// strip path prefix or suffix
 	if rewr.StripPathPrefix != "" {
 		prefix := repl.ReplaceAll(rewr.StripPathPrefix, "")
+		if !strings.HasPrefix(prefix, "/") {
+			prefix = "/" + prefix
+		}
 		mergeSlashes := !strings.Contains(prefix, "//")
 		changePath(r, func(escapedPath string) string {
 			escapedPath = caddyhttp.CleanPath(escapedPath, mergeSlashes)
@@ -266,6 +285,11 @@ func (rewr Rewrite) Rewrite(r *http.Request, repl *caddy.Replacer) bool {
 	// regular expression replacements on the path
 	for _, rep := range rewr.PathRegexp {
 		rep.do(r, repl)
+	}
+
+	// apply query operations
+	if rewr.Query != nil {
+		rewr.Query.do(r, repl)
 	}
 
 	// update the encoded copy of the URI
@@ -467,6 +491,134 @@ func changePath(req *http.Request, newVal func(pathOrRawPath string) string) {
 	if req.URL.RawPath == req.URL.Path {
 		req.URL.RawPath = ""
 	}
+}
+
+// queryOps describes the operations to perform on query keys: add, set, rename and delete.
+type queryOps struct {
+	// Renames a query key from Key to Val, without affecting the value.
+	Rename []queryOpsArguments `json:"rename,omitempty"`
+
+	// Sets query parameters; overwrites a query key with the given value.
+	Set []queryOpsArguments `json:"set,omitempty"`
+
+	// Adds query parameters; does not overwrite an existing query field,
+	// and only appends an additional value for that key if any already exist.
+	Add []queryOpsArguments `json:"add,omitempty"`
+
+	// Replaces query parameters.
+	Replace []*queryOpsReplacement `json:"replace,omitempty"`
+
+	// Deletes a given query key by name.
+	Delete []string `json:"delete,omitempty"`
+}
+
+// Provision compiles the query replace operation regex.
+func (replacement *queryOpsReplacement) Provision(_ caddy.Context) error {
+	if replacement.SearchRegexp != "" {
+		re, err := regexp.Compile(replacement.SearchRegexp)
+		if err != nil {
+			return fmt.Errorf("replacement for query field '%s': %v", replacement.Key, err)
+		}
+		replacement.re = re
+	}
+	return nil
+}
+
+func (q *queryOps) do(r *http.Request, repl *caddy.Replacer) {
+	query := r.URL.Query()
+	for _, renameParam := range q.Rename {
+		key := repl.ReplaceAll(renameParam.Key, "")
+		val := repl.ReplaceAll(renameParam.Val, "")
+		if key == "" || val == "" {
+			continue
+		}
+		query[val] = query[key]
+		delete(query, key)
+	}
+
+	for _, setParam := range q.Set {
+		key := repl.ReplaceAll(setParam.Key, "")
+		if key == "" {
+			continue
+		}
+		val := repl.ReplaceAll(setParam.Val, "")
+		query[key] = []string{val}
+	}
+
+	for _, addParam := range q.Add {
+		key := repl.ReplaceAll(addParam.Key, "")
+		if key == "" {
+			continue
+		}
+		val := repl.ReplaceAll(addParam.Val, "")
+		query[key] = append(query[key], val)
+	}
+
+	for _, replaceParam := range q.Replace {
+		key := repl.ReplaceAll(replaceParam.Key, "")
+		search := repl.ReplaceKnown(replaceParam.Search, "")
+		replace := repl.ReplaceKnown(replaceParam.Replace, "")
+
+		// replace all query keys...
+		if key == "*" {
+			for fieldName, vals := range query {
+				for i := range vals {
+					if replaceParam.re != nil {
+						query[fieldName][i] = replaceParam.re.ReplaceAllString(query[fieldName][i], replace)
+					} else {
+						query[fieldName][i] = strings.ReplaceAll(query[fieldName][i], search, replace)
+					}
+				}
+			}
+			continue
+		}
+
+		for fieldName, vals := range query {
+			for i := range vals {
+				if replaceParam.re != nil {
+					query[fieldName][i] = replaceParam.re.ReplaceAllString(query[fieldName][i], replace)
+				} else {
+					query[fieldName][i] = strings.ReplaceAll(query[fieldName][i], search, replace)
+				}
+			}
+		}
+	}
+
+	for _, deleteParam := range q.Delete {
+		param := repl.ReplaceAll(deleteParam, "")
+		if param == "" {
+			continue
+		}
+		delete(query, param)
+	}
+
+	r.URL.RawQuery = query.Encode()
+}
+
+type queryOpsArguments struct {
+	// A key in the query string. Note that query string keys may appear multiple times.
+	Key string `json:"key,omitempty"`
+
+	// The value for the given operation; for add and set, this is
+	// simply the value of the query, and for rename this is the
+	// query key to rename to.
+	Val string `json:"val,omitempty"`
+}
+
+type queryOpsReplacement struct {
+	// The key to replace in the query string.
+	Key string `json:"key,omitempty"`
+
+	// The substring to search for.
+	Search string `json:"search,omitempty"`
+
+	// The regular expression to search with.
+	SearchRegexp string `json:"search_regexp,omitempty"`
+
+	// The string with which to replace matches.
+	Replace string `json:"replace,omitempty"`
+
+	re *regexp.Regexp
 }
 
 // Interface guard

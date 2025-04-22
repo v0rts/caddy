@@ -20,8 +20,9 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/caddyserver/caddy/v2"
 	"go.uber.org/zap"
+
+	"github.com/caddyserver/caddy/v2"
 )
 
 func init() {
@@ -49,12 +50,11 @@ func (a *adminAPI) Provision(ctx caddy.Context) error {
 	a.ctx = ctx
 	a.log = ctx.Logger(a) // TODO: passing in 'a' is a hack until the admin API is officially extensible (see #5032)
 
-	// Avoid initializing PKI if it wasn't configured
-	pkiApp, err := a.ctx.AppIfConfigured("pki")
-	if err != nil {
-		return err
-	}
-	if pkiApp != nil {
+	// Avoid initializing PKI if it wasn't configured.
+	// We intentionally ignore the error since it's not
+	// fatal if the PKI app is not explicitly configured.
+	pkiApp, err := ctx.AppIfConfigured("pki")
+	if err == nil {
 		a.pkiApp = pkiApp.(*PKI)
 	}
 

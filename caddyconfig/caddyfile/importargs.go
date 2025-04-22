@@ -19,8 +19,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/caddyserver/caddy/v2"
 	"go.uber.org/zap"
+
+	"github.com/caddyserver/caddy/v2"
 )
 
 // parseVariadic determines if the token is a variadic placeholder,
@@ -48,6 +49,13 @@ func parseVariadic(token Token, argCount int) (bool, int, int) {
 	// If no ":" delimiter is found, this is not a variadic.
 	// The replacer will pick this up.
 	if !found {
+		return false, 0, 0
+	}
+
+	// A valid token may contain several placeholders, and
+	// they may be separated by ":". It's not variadic.
+	// https://github.com/caddyserver/caddy/issues/5716
+	if strings.Contains(start, "}") || strings.Contains(end, "{") {
 		return false, 0, 0
 	}
 
@@ -93,6 +101,11 @@ func makeArgsReplacer(args []string) *caddy.Replacer {
 		// TODO: Remove the deprecated {args.*} placeholder
 		// support at some point in the future
 		if matches := argsRegexpIndexDeprecated.FindStringSubmatch(key); len(matches) > 0 {
+			// What's matched may be a substring of the key
+			if matches[0] != key {
+				return nil, false
+			}
+
 			value, err := strconv.Atoi(matches[1])
 			if err != nil {
 				caddy.Log().Named("caddyfile").Warn(
@@ -111,6 +124,11 @@ func makeArgsReplacer(args []string) *caddy.Replacer {
 
 		// Handle args[*] form
 		if matches := argsRegexpIndex.FindStringSubmatch(key); len(matches) > 0 {
+			// What's matched may be a substring of the key
+			if matches[0] != key {
+				return nil, false
+			}
+
 			if strings.Contains(matches[1], ":") {
 				caddy.Log().Named("caddyfile").Warn(
 					"Variadic placeholder {args[" + matches[1] + "]} must be a token on its own")

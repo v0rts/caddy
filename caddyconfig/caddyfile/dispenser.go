@@ -30,6 +30,10 @@ type Dispenser struct {
 	tokens  []Token
 	cursor  int
 	nesting int
+
+	// A map of arbitrary context data that can be used
+	// to pass through some information to unmarshalers.
+	context map[string]any
 }
 
 // NewDispenser returns a Dispenser filled with the given tokens.
@@ -106,7 +110,7 @@ func (d *Dispenser) nextOnSameLine() bool {
 	}
 	curr := d.tokens[d.cursor]
 	next := d.tokens[d.cursor+1]
-	if curr.File == next.File && curr.Line+curr.NumLineBreaks() == next.Line {
+	if !isNextOnNewLine(curr, next) {
 		d.cursor++
 		return true
 	}
@@ -127,7 +131,7 @@ func (d *Dispenser) NextLine() bool {
 	}
 	curr := d.tokens[d.cursor]
 	next := d.tokens[d.cursor+1]
-	if curr.File != next.File || curr.Line+curr.NumLineBreaks() < next.Line {
+	if isNextOnNewLine(curr, next) {
 		d.cursor++
 		return true
 	}
@@ -391,27 +395,27 @@ func (d *Dispenser) Reset() {
 // an argument.
 func (d *Dispenser) ArgErr() error {
 	if d.Val() == "{" {
-		return d.Err("Unexpected token '{', expecting argument")
+		return d.Err("unexpected token '{', expecting argument")
 	}
-	return d.Errf("Wrong argument count or unexpected line ending after '%s'", d.Val())
+	return d.Errf("wrong argument count or unexpected line ending after '%s'", d.Val())
 }
 
 // SyntaxErr creates a generic syntax error which explains what was
 // found and what was expected.
 func (d *Dispenser) SyntaxErr(expected string) error {
-	msg := fmt.Sprintf("%s:%d - Syntax error: Unexpected token '%s', expecting '%s', import chain: ['%s']", d.File(), d.Line(), d.Val(), expected, strings.Join(d.Token().imports, "','"))
+	msg := fmt.Sprintf("syntax error: unexpected token '%s', expecting '%s', at %s:%d import chain: ['%s']", d.Val(), expected, d.File(), d.Line(), strings.Join(d.Token().imports, "','"))
 	return errors.New(msg)
 }
 
 // EOFErr returns an error indicating that the dispenser reached
 // the end of the input when searching for the next token.
 func (d *Dispenser) EOFErr() error {
-	return d.Errf("Unexpected EOF")
+	return d.Errf("unexpected EOF")
 }
 
 // Err generates a custom parse-time error with a message of msg.
 func (d *Dispenser) Err(msg string) error {
-	return d.Errf(msg)
+	return d.WrapErr(errors.New(msg))
 }
 
 // Errf is like Err, but for formatted error messages
@@ -421,7 +425,10 @@ func (d *Dispenser) Errf(format string, args ...any) error {
 
 // WrapErr takes an existing error and adds the Caddyfile file and line number.
 func (d *Dispenser) WrapErr(err error) error {
-	return fmt.Errorf("%s:%d - Error during parsing: %w, import chain: ['%s']", d.File(), d.Line(), err, strings.Join(d.Token().imports, "','"))
+	if len(d.Token().imports) > 0 {
+		return fmt.Errorf("%w, at %s:%d import chain ['%s']", err, d.File(), d.Line(), strings.Join(d.Token().imports, "','"))
+	}
+	return fmt.Errorf("%w, at %s:%d", err, d.File(), d.Line())
 }
 
 // Delete deletes the current token and returns the updated slice
@@ -451,6 +458,34 @@ func (d *Dispenser) DeleteN(amount int) []Token {
 	return d.tokens
 }
 
+// SetContext sets a key-value pair in the context map.
+func (d *Dispenser) SetContext(key string, value any) {
+	if d.context == nil {
+		d.context = make(map[string]any)
+	}
+	d.context[key] = value
+}
+
+// GetContext gets the value of a key in the context map.
+func (d *Dispenser) GetContext(key string) any {
+	if d.context == nil {
+		return nil
+	}
+	return d.context[key]
+}
+
+// GetContextString gets the value of a key in the context map
+// as a string, or an empty string if the key does not exist.
+func (d *Dispenser) GetContextString(key string) string {
+	if d.context == nil {
+		return ""
+	}
+	if val, ok := d.context[key].(string); ok {
+		return val
+	}
+	return ""
+}
+
 // isNewLine determines whether the current token is on a different
 // line (higher line number) than the previous token. It handles imported
 // tokens correctly. If there isn't a previous token, it returns true.
@@ -464,17 +499,7 @@ func (d *Dispenser) isNewLine() bool {
 
 	prev := d.tokens[d.cursor-1]
 	curr := d.tokens[d.cursor]
-
-	// If the previous token is from a different file,
-	// we can assume it's from a different line
-	if prev.File != curr.File {
-		return true
-	}
-
-	// If the previous token (incl line breaks) ends
-	// on a line earlier than the current token,
-	// then the current token is on a new line
-	return prev.Line+prev.NumLineBreaks() < curr.Line
+	return isNextOnNewLine(prev, curr)
 }
 
 // isNextOnNewLine determines whether the current token is on a different
@@ -490,15 +515,7 @@ func (d *Dispenser) isNextOnNewLine() bool {
 
 	curr := d.tokens[d.cursor]
 	next := d.tokens[d.cursor+1]
-
-	// If the next token is from a different file,
-	// we can assume it's from a different line
-	if curr.File != next.File {
-		return true
-	}
-
-	// If the current token (incl line breaks) ends
-	// on a line earlier than the next token,
-	// then the next token is on a new line
-	return curr.Line+curr.NumLineBreaks() < next.Line
+	return isNextOnNewLine(curr, next)
 }
+
+const MatcherNameCtxKey = "matcher_name"

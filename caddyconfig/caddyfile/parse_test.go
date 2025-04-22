@@ -22,7 +22,7 @@ import (
 )
 
 func TestParseVariadic(t *testing.T) {
-	var args = make([]string, 10)
+	args := make([]string, 10)
 	for i, tc := range []struct {
 		input  string
 		result bool
@@ -91,6 +91,10 @@ func TestParseVariadic(t *testing.T) {
 			input:  "{args[0:10]}",
 			result: true,
 		},
+		{
+			input:  "{args[0]}:{args[1]}:{args[2]}",
+			result: false,
+		},
 	} {
 		token := Token{
 			File: "test",
@@ -107,7 +111,6 @@ func TestAllTokens(t *testing.T) {
 	input := []byte("a b c\nd e")
 	expected := []string{"a", "b", "c", "d", "e"}
 	tokens, err := allTokens("TestAllTokens", input)
-
 	if err != nil {
 		t.Fatalf("Expected no error, got %v", err)
 	}
@@ -145,10 +148,11 @@ func TestParseOneAndImport(t *testing.T) {
 			"localhost",
 		}, []int{1}},
 
-		{`localhost:1234
+		{
+			`localhost:1234
 		  dir1 foo bar`, false, []string{
-			"localhost:1234",
-		}, []int{3},
+				"localhost:1234",
+			}, []int{3},
 		},
 
 		{`localhost {
@@ -343,7 +347,7 @@ func TestParseOneAndImport(t *testing.T) {
 				i, len(test.keys), len(result.Keys))
 			continue
 		}
-		for j, addr := range result.Keys {
+		for j, addr := range result.GetKeysText() {
 			if addr != test.keys[j] {
 				t.Errorf("Test %d, key %d: Expected '%s', but was '%s'",
 					i, j, test.keys[j], addr)
@@ -375,8 +379,9 @@ func TestRecursiveImport(t *testing.T) {
 	}
 
 	isExpected := func(got ServerBlock) bool {
-		if len(got.Keys) != 1 || got.Keys[0] != "localhost" {
-			t.Errorf("got keys unexpected: expect localhost, got %v", got.Keys)
+		textKeys := got.GetKeysText()
+		if len(textKeys) != 1 || textKeys[0] != "localhost" {
+			t.Errorf("got keys unexpected: expect localhost, got %v", textKeys)
 			return false
 		}
 		if len(got.Segments) != 2 {
@@ -403,13 +408,13 @@ func TestRecursiveImport(t *testing.T) {
 	err = os.WriteFile(recursiveFile1, []byte(
 		`localhost
 		dir1
-		import recursive_import_test2`), 0644)
+		import recursive_import_test2`), 0o644)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer os.Remove(recursiveFile1)
 
-	err = os.WriteFile(recursiveFile2, []byte("dir2 1"), 0644)
+	err = os.WriteFile(recursiveFile2, []byte("dir2 1"), 0o644)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -437,7 +442,7 @@ func TestRecursiveImport(t *testing.T) {
 	err = os.WriteFile(recursiveFile1, []byte(
 		`localhost
 		dir1
-		import `+recursiveFile2), 0644)
+		import `+recursiveFile2), 0o644)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -470,8 +475,9 @@ func TestDirectiveImport(t *testing.T) {
 	}
 
 	isExpected := func(got ServerBlock) bool {
-		if len(got.Keys) != 1 || got.Keys[0] != "localhost" {
-			t.Errorf("got keys unexpected: expect localhost, got %v", got.Keys)
+		textKeys := got.GetKeysText()
+		if len(textKeys) != 1 || textKeys[0] != "localhost" {
+			t.Errorf("got keys unexpected: expect localhost, got %v", textKeys)
 			return false
 		}
 		if len(got.Segments) != 2 {
@@ -491,7 +497,7 @@ func TestDirectiveImport(t *testing.T) {
 	}
 
 	err = os.WriteFile(directiveFile, []byte(`prop1 1
-	prop2 2`), 0644)
+	prop2 2`), 0o644)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -547,6 +553,10 @@ func TestParseAll(t *testing.T) {
 
 		{`localhost:1234, http://host2`, false, [][]string{
 			{"localhost:1234", "http://host2"},
+		}},
+
+		{`foo.example.com   ,   example.com`, false, [][]string{
+			{"foo.example.com", "example.com"},
 		}},
 
 		{`localhost:1234, http://host2,`, true, [][]string{}},
@@ -608,11 +618,11 @@ func TestParseAll(t *testing.T) {
 		}
 		for j, block := range blocks {
 			if len(block.Keys) != len(test.keys[j]) {
-				t.Errorf("Test %d: Expected %d keys in block %d, got %d",
-					i, len(test.keys[j]), j, len(block.Keys))
+				t.Errorf("Test %d: Expected %d keys in block %d, got %d: %v",
+					i, len(test.keys[j]), j, len(block.Keys), block.Keys)
 				continue
 			}
-			for k, addr := range block.Keys {
+			for k, addr := range block.GetKeysText() {
 				if addr != test.keys[j][k] {
 					t.Errorf("Test %d, block %d, key %d: Expected '%s', but got '%s'",
 						i, j, k, test.keys[j][k], addr)
@@ -718,6 +728,36 @@ func TestEnvironmentReplacement(t *testing.T) {
 	}
 }
 
+func TestImportReplacementInJSONWithBrace(t *testing.T) {
+	for i, test := range []struct {
+		args   []string
+		input  string
+		expect string
+	}{
+		{
+			args:   []string{"123"},
+			input:  "{args[0]}",
+			expect: "123",
+		},
+		{
+			args:   []string{"123"},
+			input:  `{"key":"{args[0]}"}`,
+			expect: `{"key":"123"}`,
+		},
+		{
+			args:   []string{"123", "123"},
+			input:  `{"key":[{args[0]},{args[1]}]}`,
+			expect: `{"key":[123,123]}`,
+		},
+	} {
+		repl := makeArgsReplacer(test.args)
+		actual := repl.ReplaceKnown(test.input, "")
+		if actual != test.expect {
+			t.Errorf("Test %d: Expected: '%s' but got '%s'", i, test.expect, actual)
+		}
+	}
+}
+
 func TestSnippets(t *testing.T) {
 	p := testParser(`
 		(common) {
@@ -735,7 +775,7 @@ func TestSnippets(t *testing.T) {
 	if len(blocks) != 1 {
 		t.Fatalf("Expect exactly one server block. Got %d.", len(blocks))
 	}
-	if actual, expected := blocks[0].Keys[0], "http://example.com"; expected != actual {
+	if actual, expected := blocks[0].GetKeysText()[0], "http://example.com"; expected != actual {
 		t.Errorf("Expected server name to be '%s' but was '%s'", expected, actual)
 	}
 	if len(blocks[0].Segments) != 2 {
@@ -767,7 +807,7 @@ func TestImportedFilesIgnoreNonDirectiveImportTokens(t *testing.T) {
 	fileName := writeStringToTempFileOrDie(t, `
 		http://example.com {
 			# This isn't an import directive, it's just an arg with value 'import'
-			basicauth / import password
+			basic_auth / import password
 		}
 	`)
 	// Parse the root file that imports the other one.
@@ -778,12 +818,12 @@ func TestImportedFilesIgnoreNonDirectiveImportTokens(t *testing.T) {
 	}
 	auth := blocks[0].Segments[0]
 	line := auth[0].Text + " " + auth[1].Text + " " + auth[2].Text + " " + auth[3].Text
-	if line != "basicauth / import password" {
+	if line != "basic_auth / import password" {
 		// Previously, it would be changed to:
-		//   basicauth / import /path/to/test/dir/password
+		//   basic_auth / import /path/to/test/dir/password
 		// referencing a file that (probably) doesn't exist and changing the
 		// password!
-		t.Errorf("Expected basicauth tokens to be 'basicauth / import password' but got %#q", line)
+		t.Errorf("Expected basic_auth tokens to be 'basic_auth / import password' but got %#q", line)
 	}
 }
 
@@ -810,7 +850,7 @@ func TestSnippetAcrossMultipleFiles(t *testing.T) {
 	if len(blocks) != 1 {
 		t.Fatalf("Expect exactly one server block. Got %d.", len(blocks))
 	}
-	if actual, expected := blocks[0].Keys[0], "http://example.com"; expected != actual {
+	if actual, expected := blocks[0].GetKeysText()[0], "http://example.com"; expected != actual {
 		t.Errorf("Expected server name to be '%s' but was '%s'", expected, actual)
 	}
 	if len(blocks[0].Segments) != 1 {
@@ -818,6 +858,29 @@ func TestSnippetAcrossMultipleFiles(t *testing.T) {
 	}
 	if actual, expected := blocks[0].Segments[0][0].Text, "gzip"; expected != actual {
 		t.Errorf("Expected argument to be '%s' but was '%s'", expected, actual)
+	}
+}
+
+func TestRejectsGlobalMatcher(t *testing.T) {
+	p := testParser(`
+		@rejected path /foo
+
+		(common) {
+			gzip foo
+			errors stderr
+		}
+
+		http://example.com {
+			import common
+		}
+	`)
+	_, err := p.parseAll()
+	if err == nil {
+		t.Fatal("Expected an error, but got nil")
+	}
+	expected := "request matchers may not be defined globally, they must be in a site block; found @rejected, at Testfile:2"
+	if err.Error() != expected {
+		t.Errorf("Expected error to be '%s' but got '%v'", expected, err)
 	}
 }
 

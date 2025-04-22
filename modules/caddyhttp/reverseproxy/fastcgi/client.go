@@ -40,6 +40,9 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
 // FCGIListenSockFileno describes listen socket file number.
@@ -135,6 +138,15 @@ type client struct {
 // Do made the request and returns a io.Reader that translates the data read
 // from fcgi responder out of fcgi packet before returning it.
 func (c *client) Do(p map[string]string, req io.Reader) (r io.Reader, err error) {
+	// check for CONTENT_LENGTH, since the lack of it or wrong value will cause the backend to hang
+	if clStr, ok := p["CONTENT_LENGTH"]; !ok {
+		return nil, caddyhttp.Error(http.StatusLengthRequired, nil)
+	} else if _, err := strconv.ParseUint(clStr, 10, 64); err != nil {
+		// stdlib won't return a negative Content-Length, but we check just in case,
+		// the most likely cause is from a missing content length, which is -1
+		return nil, caddyhttp.Error(http.StatusLengthRequired, err)
+	}
+
 	writer := &streamWriter{c: c}
 	writer.buf = bufPool.Get().(*bytes.Buffer)
 	writer.buf.Reset()
@@ -184,10 +196,13 @@ func (f clientCloser) Close() error {
 		return f.rwc.Close()
 	}
 
+	logLevel := zapcore.WarnLevel
 	if f.status >= 400 {
-		f.logger.Error("stderr", zap.ByteString("body", stderr))
-	} else {
-		f.logger.Warn("stderr", zap.ByteString("body", stderr))
+		logLevel = zapcore.ErrorLevel
+	}
+
+	if c := f.logger.Check(logLevel, "stderr"); c != nil {
+		c.Write(zap.ByteString("body", stderr))
 	}
 
 	return f.rwc.Close()
@@ -221,7 +236,6 @@ func (c *client) Request(p map[string]string, req io.Reader) (resp *http.Respons
 		if statusIsCut {
 			resp.Status = statusInfo
 		}
-
 	} else {
 		resp.StatusCode = http.StatusOK
 	}
@@ -251,7 +265,6 @@ func (c *client) Request(p map[string]string, req io.Reader) (resp *http.Respons
 
 // Get issues a GET request to the fcgi responder.
 func (c *client) Get(p map[string]string, body io.Reader, l int64) (resp *http.Response, err error) {
-
 	p["REQUEST_METHOD"] = "GET"
 	p["CONTENT_LENGTH"] = strconv.FormatInt(l, 10)
 
@@ -260,7 +273,6 @@ func (c *client) Get(p map[string]string, body io.Reader, l int64) (resp *http.R
 
 // Head issues a HEAD request to the fcgi responder.
 func (c *client) Head(p map[string]string) (resp *http.Response, err error) {
-
 	p["REQUEST_METHOD"] = "HEAD"
 	p["CONTENT_LENGTH"] = "0"
 
@@ -269,7 +281,6 @@ func (c *client) Head(p map[string]string) (resp *http.Response, err error) {
 
 // Options issues an OPTIONS request to the fcgi responder.
 func (c *client) Options(p map[string]string) (resp *http.Response, err error) {
-
 	p["REQUEST_METHOD"] = "OPTIONS"
 	p["CONTENT_LENGTH"] = "0"
 

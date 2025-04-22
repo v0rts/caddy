@@ -24,32 +24,12 @@ import (
 )
 
 // ResponseWriterWrapper wraps an underlying ResponseWriter and
-// promotes its Pusher/Flusher/Hijacker methods as well. To use
-// this type, embed a pointer to it within your own struct type
-// that implements the http.ResponseWriter interface, then call
-// methods on the embedded value. You can make sure your type
-// wraps correctly by asserting that it implements the
-// HTTPInterfaces interface.
+// promotes its Pusher method as well. To use this type, embed
+// a pointer to it within your own struct type that implements
+// the http.ResponseWriter interface, then call methods on the
+// embedded value.
 type ResponseWriterWrapper struct {
 	http.ResponseWriter
-}
-
-// Hijack implements http.Hijacker. It simply calls the underlying
-// ResponseWriter's Hijack method if there is one, or returns
-// ErrNotImplemented otherwise.
-func (rww *ResponseWriterWrapper) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	if hj, ok := rww.ResponseWriter.(http.Hijacker); ok {
-		return hj.Hijack()
-	}
-	return nil, nil, ErrNotImplemented
-}
-
-// Flush implements http.Flusher. It simply calls the underlying
-// ResponseWriter's Flush method if there is one.
-func (rww *ResponseWriterWrapper) Flush() {
-	if f, ok := rww.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
-	}
 }
 
 // Push implements http.Pusher. It simply calls the underlying
@@ -62,9 +42,9 @@ func (rww *ResponseWriterWrapper) Push(target string, opts *http.PushOptions) er
 	return ErrNotImplemented
 }
 
-// ReadFrom implements io.ReaderFrom. It simply calls the underlying
-// ResponseWriter's ReadFrom method if there is one, otherwise it defaults
-// to io.Copy.
+// ReadFrom implements io.ReaderFrom. It retries to use io.ReaderFrom if available,
+// then fallback to io.Copy.
+// see: https://github.com/caddyserver/caddy/issues/6546
 func (rww *ResponseWriterWrapper) ReadFrom(r io.Reader) (n int64, err error) {
 	if rf, ok := rww.ResponseWriter.(io.ReaderFrom); ok {
 		return rf.ReadFrom(r)
@@ -72,17 +52,10 @@ func (rww *ResponseWriterWrapper) ReadFrom(r io.Reader) (n int64, err error) {
 	return io.Copy(rww.ResponseWriter, r)
 }
 
-// Unwrap returns the underlying ResponseWriter.
+// Unwrap returns the underlying ResponseWriter, necessary for
+// http.ResponseController to work correctly.
 func (rww *ResponseWriterWrapper) Unwrap() http.ResponseWriter {
 	return rww.ResponseWriter
-}
-
-// HTTPInterfaces mix all the interfaces that middleware ResponseWriters need to support.
-type HTTPInterfaces interface {
-	http.ResponseWriter
-	http.Pusher
-	http.Flusher
-	http.Hijacker
 }
 
 // ErrNotImplemented is returned when an underlying
@@ -97,6 +70,8 @@ type responseRecorder struct {
 	size         int
 	wroteHeader  bool
 	stream       bool
+
+	readSize *int
 }
 
 // NewResponseRecorder returns a new ResponseRecorder that can be
@@ -179,16 +154,16 @@ func (rr *responseRecorder) WriteHeader(statusCode int) {
 	// connections by manually setting headers and writing status 101
 	rr.statusCode = statusCode
 
+	// decide whether we should buffer the response
+	if rr.shouldBuffer == nil {
+		rr.stream = true
+	} else {
+		rr.stream = !rr.shouldBuffer(rr.statusCode, rr.ResponseWriterWrapper.Header())
+	}
+
 	// 1xx responses aren't final; just informational
 	if statusCode < 100 || statusCode > 199 {
 		rr.wroteHeader = true
-
-		// decide whether we should buffer the response
-		if rr.shouldBuffer == nil {
-			rr.stream = true
-		} else {
-			rr.stream = !rr.shouldBuffer(rr.statusCode, rr.ResponseWriterWrapper.Header())
-		}
 	}
 
 	// if informational or not buffered, immediately write header
@@ -248,27 +223,55 @@ func (rr *responseRecorder) Buffered() bool {
 }
 
 func (rr *responseRecorder) WriteResponse() error {
-	if rr.stream {
-		return nil
-	}
 	if rr.statusCode == 0 {
 		// could happen if no handlers actually wrote anything,
 		// and this prevents a panic; status must be > 0
-		rr.statusCode = http.StatusOK
+		rr.WriteHeader(http.StatusOK)
+	}
+	if rr.stream {
+		return nil
 	}
 	rr.ResponseWriterWrapper.WriteHeader(rr.statusCode)
 	_, err := io.Copy(rr.ResponseWriterWrapper, rr.buf)
 	return err
 }
 
+// FlushError will suppress actual flushing if the response is buffered. See:
+// https://github.com/caddyserver/caddy/issues/6144
+func (rr *responseRecorder) FlushError() error {
+	if rr.stream {
+		//nolint:bodyclose
+		return http.NewResponseController(rr.ResponseWriterWrapper).Flush()
+	}
+	return nil
+}
+
+// Private interface so it can only be used in this package
+// #TODO: maybe export it later
+func (rr *responseRecorder) setReadSize(size *int) {
+	rr.readSize = size
+}
+
 func (rr *responseRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	conn, brw, err := rr.ResponseWriterWrapper.Hijack()
+	//nolint:bodyclose
+	conn, brw, err := http.NewResponseController(rr.ResponseWriterWrapper).Hijack()
 	if err != nil {
 		return nil, nil, err
 	}
 	// Per http documentation, returned bufio.Writer is empty, but bufio.Read maybe not
 	conn = &hijackedConn{conn, rr}
 	brw.Writer.Reset(conn)
+
+	buffered := brw.Reader.Buffered()
+	if buffered != 0 {
+		conn.(*hijackedConn).updateReadSize(buffered)
+		data, _ := brw.Peek(buffered)
+		brw.Reader.Reset(io.MultiReader(bytes.NewReader(data), conn))
+		// peek to make buffered data appear, as Reset will make it 0
+		_, _ = brw.Peek(buffered)
+	} else {
+		brw.Reader.Reset(conn)
+	}
 	return conn, brw, nil
 }
 
@@ -276,6 +279,24 @@ func (rr *responseRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 type hijackedConn struct {
 	net.Conn
 	rr *responseRecorder
+}
+
+func (hc *hijackedConn) updateReadSize(n int) {
+	if hc.rr.readSize != nil {
+		*hc.rr.readSize += n
+	}
+}
+
+func (hc *hijackedConn) Read(p []byte) (int, error) {
+	n, err := hc.Conn.Read(p)
+	hc.updateReadSize(n)
+	return n, err
+}
+
+func (hc *hijackedConn) WriteTo(w io.Writer) (int64, error) {
+	n, err := io.Copy(w, hc.Conn)
+	hc.updateReadSize(int(n))
+	return n, err
 }
 
 func (hc *hijackedConn) Write(p []byte) (int, error) {
@@ -294,7 +315,7 @@ func (hc *hijackedConn) ReadFrom(r io.Reader) (int64, error) {
 // responses instead of writing them to the client. See
 // docs for NewResponseRecorder for proper usage.
 type ResponseRecorder interface {
-	HTTPInterfaces
+	http.ResponseWriter
 	Status() int
 	Buffer() *bytes.Buffer
 	Buffered() bool
@@ -309,12 +330,15 @@ type ShouldBufferFunc func(status int, header http.Header) bool
 
 // Interface guards
 var (
-	_ HTTPInterfaces   = (*ResponseWriterWrapper)(nil)
-	_ ResponseRecorder = (*responseRecorder)(nil)
+	_ http.ResponseWriter = (*ResponseWriterWrapper)(nil)
+	_ ResponseRecorder    = (*responseRecorder)(nil)
 
 	// Implementing ReaderFrom can be such a significant
 	// optimization that it should probably be required!
 	// see PR #5022 (25%-50% speedup)
 	_ io.ReaderFrom = (*ResponseWriterWrapper)(nil)
 	_ io.ReaderFrom = (*responseRecorder)(nil)
+	_ io.ReaderFrom = (*hijackedConn)(nil)
+
+	_ io.WriterTo = (*hijackedConn)(nil)
 )

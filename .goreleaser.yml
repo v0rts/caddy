@@ -1,3 +1,5 @@
+version: 2
+
 before:
   hooks:
     # The build is done in this particular way to build Caddy in a designated directory named in .gitignore.
@@ -10,6 +12,9 @@ before:
     - mkdir -p caddy-build
     - cp cmd/caddy/main.go caddy-build/main.go
     - /bin/sh -c 'cd ./caddy-build && go mod init caddy'
+    # prepare syso files for windows embedding
+    - /bin/sh -c 'for a in amd64 arm arm64; do XCADDY_SKIP_BUILD=1 GOOS=windows GOARCH=$a xcaddy build {{.Env.TAG}}; done'
+    - /bin/sh -c 'mv /tmp/buildenv_*/*.syso caddy-build'
     # GoReleaser doesn't seem to offer {{.Tag}} at this stage, so we have to embed it into the env
     # so we run: TAG=$(git describe --abbrev=0) goreleaser release --rm-dist --skip-publish --skip-validate
     - go mod edit -require=github.com/caddyserver/caddy/v2@{{.Env.TAG}} ./caddy-build/go.mod
@@ -29,7 +34,6 @@ builds:
 - env:
   - CGO_ENABLED=0
   - GO111MODULE=on
-  main: main.go
   dir: ./caddy-build
   binary: caddy
   goos:
@@ -43,6 +47,7 @@ builds:
   - arm64
   - s390x
   - ppc64le
+  - riscv64
   goarm:
   - "5"
   - "6"
@@ -54,14 +59,20 @@ builds:
       goarch: ppc64le
     - goos: darwin
       goarch: s390x
+    - goos: darwin
+      goarch: riscv64
     - goos: windows
       goarch: ppc64le
     - goos: windows
       goarch: s390x
+    - goos: windows
+      goarch: riscv64
     - goos: freebsd
       goarch: ppc64le
     - goos: freebsd
       goarch: s390x
+    - goos: freebsd
+      goarch: riscv64
     - goos: freebsd
       goarch: arm
       goarm: "5"
@@ -70,6 +81,10 @@ builds:
   - -mod=readonly
   ldflags:
   - -s -w
+  tags:
+  - nobadger
+  - nomysql
+  - nopgx
 
 signs:
   - cmd: cosign
@@ -96,7 +111,7 @@ archives:
   - id: default
     format_overrides:
       - goos: windows
-        format: zip
+        formats: zip
     name_template: >-
       {{ .ProjectName }}_
       {{- .Version }}_
@@ -106,11 +121,10 @@ archives:
       {{- with .Mips }}_{{ . }}{{ end }}
       {{- if not (eq .Amd64 "v1") }}{{ .Amd64 }}{{ end }}
   
-  # packge the 'caddy-build' directory into a tarball,
+  # package the 'caddy-build' directory into a tarball,
   # allowing users to build the exact same set of files as ours.
   - id: source
     meta: true
-    rlcp: true
     name_template: "{{ .ProjectName }}_{{ .Version }}_buildable-artifact"
     files:
       - src: LICENSE
@@ -126,14 +140,6 @@ source:
   enabled: true
   name_template: '{{ .ProjectName }}_{{ .Version }}_src'
   format: 'tar.gz'
-
-  # This will make the destination paths be relative to the longest common
-  # path prefix between all the files matched and the source glob.
-  # Enabling this essentially mimic the behavior of nfpm's contents section.
-  # It will be the default by June 2023.
-  #
-  # Default: false
-  rlcp: true
 
   # Additional files/template/globs you want to add to the source archive.
   #
@@ -185,6 +191,9 @@ nfpms:
       postinstall: ./caddy-dist/scripts/postinstall.sh
       preremove: ./caddy-dist/scripts/preremove.sh
       postremove: ./caddy-dist/scripts/postremove.sh
+
+    provides:
+      - httpd
 
 release:
   github:

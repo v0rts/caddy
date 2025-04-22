@@ -16,19 +16,24 @@ package reverseproxy
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"reflect"
 	"strconv"
 	"strings"
 
+	"github.com/dustin/go-humanize"
+
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
+	"github.com/caddyserver/caddy/v2/internal"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp/headers"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp/rewrite"
-	"github.com/dustin/go-humanize"
+	"github.com/caddyserver/caddy/v2/modules/caddytls"
+	"github.com/caddyserver/caddy/v2/modules/internal/network"
 )
 
 func init() {
@@ -65,12 +70,17 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 //	    lb_retry_match <request-matcher>
 //
 //	    # active health checking
-//	    health_uri      <uri>
-//	    health_port     <port>
-//	    health_interval <interval>
-//	    health_timeout  <duration>
-//	    health_status   <status>
-//	    health_body     <regexp>
+//	    health_uri          <uri>
+//	    health_port         <port>
+//	    health_interval     <interval>
+//	    health_passes       <num>
+//	    health_fails        <num>
+//	    health_timeout      <duration>
+//	    health_status       <status>
+//	    health_body         <regexp>
+//	    health_method       <value>
+//	    health_request_body <value>
+//	    health_follow_redirects
 //	    health_headers {
 //	        <field> [<values...>]
 //	    }
@@ -83,10 +93,12 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 //	    unhealthy_request_count <num>
 //
 //	    # streaming
-//	    flush_interval <duration>
-//	    buffer_requests
-//	    buffer_responses
-//	    max_buffer_size <size>
+//	    flush_interval     <duration>
+//	    request_buffers    <size>
+//	    response_buffers   <size>
+//	    stream_timeout     <duration>
+//	    stream_close_delay <duration>
+//	    verbose_logs
 //
 //	    # request manipulation
 //	    trusted_proxies [private_ranges] <ranges...>
@@ -144,7 +156,7 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	// appendUpstream creates an upstream for address and adds
 	// it to the list.
 	appendUpstream := func(address string) error {
-		dialAddr, scheme, err := parseUpstreamDialAddress(address)
+		pa, err := parseUpstreamDialAddress(address)
 		if err != nil {
 			return d.WrapErr(err)
 		}
@@ -152,21 +164,39 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		// the underlying JSON does not yet support different
 		// transports (protocols or schemes) to each backend,
 		// so we remember the last one we see and compare them
-		if commonScheme != "" && scheme != commonScheme {
-			return d.Errf("for now, all proxy upstreams must use the same scheme (transport protocol); expecting '%s://' but got '%s://'",
-				commonScheme, scheme)
-		}
-		commonScheme = scheme
 
-		parsedAddr, err := caddy.ParseNetworkAddress(dialAddr)
+		switch pa.scheme {
+		case "wss":
+			return d.Errf("the scheme wss:// is only supported in browsers; use https:// instead")
+		case "ws":
+			return d.Errf("the scheme ws:// is only supported in browsers; use http:// instead")
+		case "https", "http", "h2c", "":
+			// Do nothing or handle the valid schemes
+		default:
+			return d.Errf("unsupported URL scheme %s://", pa.scheme)
+		}
+
+		if commonScheme != "" && pa.scheme != commonScheme {
+			return d.Errf("for now, all proxy upstreams must use the same scheme (transport protocol); expecting '%s://' but got '%s://'",
+				commonScheme, pa.scheme)
+		}
+		commonScheme = pa.scheme
+
+		// if the port of upstream address contains a placeholder, only wrap it with the `Upstream` struct,
+		// delaying actual resolution of the address until request time.
+		if pa.replaceablePort() {
+			h.Upstreams = append(h.Upstreams, &Upstream{Dial: pa.dialAddr()})
+			return nil
+		}
+		parsedAddr, err := caddy.ParseNetworkAddress(pa.dialAddr())
 		if err != nil {
 			return d.WrapErr(err)
 		}
 
-		if parsedAddr.StartPort == 0 && parsedAddr.EndPort == 0 {
+		if pa.isUnix() || !pa.rangedPort() {
 			// unix networks don't have ports
 			h.Upstreams = append(h.Upstreams, &Upstream{
-				Dial: dialAddr,
+				Dial: pa.dialAddr(),
 			})
 		} else {
 			// expand a port range into multiple upstreams
@@ -184,11 +214,11 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for _, up := range d.RemainingArgs() {
 		err := appendUpstream(up)
 		if err != nil {
-			return err
+			return fmt.Errorf("parsing upstream '%s': %w", up, err)
 		}
 	}
 
-	for nesting := d.Nesting(); d.NextBlock(nesting); {
+	for d.NextBlock(0) {
 		// if the subdirective has an "@" prefix then we
 		// parse it as a response matcher for use with "handle_response"
 		if strings.HasPrefix(d.Val(), matcherPrefix) {
@@ -208,7 +238,7 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			for _, up := range args {
 				err := appendUpstream(up)
 				if err != nil {
-					return err
+					return fmt.Errorf("parsing upstream '%s': %w", up, err)
 				}
 			}
 
@@ -327,6 +357,26 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			h.HealthChecks.Active.Path = d.Val()
 			caddy.Log().Named("config.adapter.caddyfile").Warn("the 'health_path' subdirective is deprecated, please use 'health_uri' instead!")
 
+		case "health_upstream":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			if h.HealthChecks == nil {
+				h.HealthChecks = new(HealthChecks)
+			}
+			if h.HealthChecks.Active == nil {
+				h.HealthChecks.Active = new(ActiveHealthChecks)
+			}
+			_, port, err := net.SplitHostPort(d.Val())
+			if err != nil {
+				return d.Errf("health_upstream is malformed '%s': %v", d.Val(), err)
+			}
+			_, err = strconv.Atoi(port)
+			if err != nil {
+				return d.Errf("bad port number '%s': %v", d.Val(), err)
+			}
+			h.HealthChecks.Active.Upstream = d.Val()
+
 		case "health_port":
 			if !d.NextArg() {
 				return d.ArgErr()
@@ -336,6 +386,9 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			}
 			if h.HealthChecks.Active == nil {
 				h.HealthChecks.Active = new(ActiveHealthChecks)
+			}
+			if h.HealthChecks.Active.Upstream != "" {
+				return d.Errf("the 'health_port' subdirective is ignored if 'health_upstream' is used!")
 			}
 			portNum, err := strconv.Atoi(d.Val())
 			if err != nil {
@@ -351,7 +404,7 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				if len(values) == 0 {
 					values = append(values, "")
 				}
-				healthHeaders[key] = values
+				healthHeaders[key] = append(healthHeaders[key], values...)
 			}
 			if h.HealthChecks == nil {
 				h.HealthChecks = new(HealthChecks)
@@ -360,6 +413,30 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				h.HealthChecks.Active = new(ActiveHealthChecks)
 			}
 			h.HealthChecks.Active.Headers = healthHeaders
+
+		case "health_method":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			if h.HealthChecks == nil {
+				h.HealthChecks = new(HealthChecks)
+			}
+			if h.HealthChecks.Active == nil {
+				h.HealthChecks.Active = new(ActiveHealthChecks)
+			}
+			h.HealthChecks.Active.Method = d.Val()
+
+		case "health_request_body":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			if h.HealthChecks == nil {
+				h.HealthChecks = new(HealthChecks)
+			}
+			if h.HealthChecks.Active == nil {
+				h.HealthChecks.Active = new(ActiveHealthChecks)
+			}
+			h.HealthChecks.Active.Body = d.Val()
 
 		case "health_interval":
 			if !d.NextArg() {
@@ -424,6 +501,50 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				h.HealthChecks.Active = new(ActiveHealthChecks)
 			}
 			h.HealthChecks.Active.ExpectBody = d.Val()
+
+		case "health_follow_redirects":
+			if d.NextArg() {
+				return d.ArgErr()
+			}
+			if h.HealthChecks == nil {
+				h.HealthChecks = new(HealthChecks)
+			}
+			if h.HealthChecks.Active == nil {
+				h.HealthChecks.Active = new(ActiveHealthChecks)
+			}
+			h.HealthChecks.Active.FollowRedirects = true
+
+		case "health_passes":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			if h.HealthChecks == nil {
+				h.HealthChecks = new(HealthChecks)
+			}
+			if h.HealthChecks.Active == nil {
+				h.HealthChecks.Active = new(ActiveHealthChecks)
+			}
+			passes, err := strconv.Atoi(d.Val())
+			if err != nil {
+				return d.Errf("invalid passes count '%s': %v", d.Val(), err)
+			}
+			h.HealthChecks.Active.Passes = passes
+
+		case "health_fails":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			if h.HealthChecks == nil {
+				h.HealthChecks = new(HealthChecks)
+			}
+			if h.HealthChecks.Active == nil {
+				h.HealthChecks.Active = new(ActiveHealthChecks)
+			}
+			fails, err := strconv.Atoi(d.Val())
+			if err != nil {
+				return d.Errf("invalid fails count '%s': %v", d.Val(), err)
+			}
+			h.HealthChecks.Active.Fails = fails
 
 		case "max_fails":
 			if !d.NextArg() {
@@ -530,51 +651,58 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			if !d.NextArg() {
 				return d.ArgErr()
 			}
-			size, err := humanize.ParseBytes(d.Val())
-			if err != nil {
-				return d.Errf("invalid byte size '%s': %v", d.Val(), err)
+			val := d.Val()
+			var size int64
+			if val == "unlimited" {
+				size = -1
+			} else {
+				usize, err := humanize.ParseBytes(val)
+				if err != nil {
+					return d.Errf("invalid byte size '%s': %v", val, err)
+				}
+				size = int64(usize)
 			}
 			if d.NextArg() {
 				return d.ArgErr()
 			}
 			if subdir == "request_buffers" {
-				h.RequestBuffers = int64(size)
+				h.RequestBuffers = size
 			} else if subdir == "response_buffers" {
-				h.ResponseBuffers = int64(size)
-
+				h.ResponseBuffers = size
 			}
 
-		// TODO: These three properties are deprecated; remove them sometime after v2.6.4
-		case "buffer_requests": // TODO: deprecated
-			if d.NextArg() {
-				return d.ArgErr()
-			}
-			caddy.Log().Named("config.adapter.caddyfile").Warn("DEPRECATED: buffer_requests: use request_buffers instead (with a maximum buffer size)")
-			h.DeprecatedBufferRequests = true
-		case "buffer_responses": // TODO: deprecated
-			if d.NextArg() {
-				return d.ArgErr()
-			}
-			caddy.Log().Named("config.adapter.caddyfile").Warn("DEPRECATED: buffer_responses: use response_buffers instead (with a maximum buffer size)")
-			h.DeprecatedBufferResponses = true
-		case "max_buffer_size": // TODO: deprecated
+		case "stream_timeout":
 			if !d.NextArg() {
 				return d.ArgErr()
 			}
-			size, err := humanize.ParseBytes(d.Val())
-			if err != nil {
-				return d.Errf("invalid byte size '%s': %v", d.Val(), err)
+			if fi, err := strconv.Atoi(d.Val()); err == nil {
+				h.StreamTimeout = caddy.Duration(fi)
+			} else {
+				dur, err := caddy.ParseDuration(d.Val())
+				if err != nil {
+					return d.Errf("bad duration value '%s': %v", d.Val(), err)
+				}
+				h.StreamTimeout = caddy.Duration(dur)
 			}
-			if d.NextArg() {
+
+		case "stream_close_delay":
+			if !d.NextArg() {
 				return d.ArgErr()
 			}
-			caddy.Log().Named("config.adapter.caddyfile").Warn("DEPRECATED: max_buffer_size: use request_buffers and/or response_buffers instead (with maximum buffer sizes)")
-			h.DeprecatedMaxBufferSize = int64(size)
+			if fi, err := strconv.Atoi(d.Val()); err == nil {
+				h.StreamCloseDelay = caddy.Duration(fi)
+			} else {
+				dur, err := caddy.ParseDuration(d.Val())
+				if err != nil {
+					return d.Errf("bad duration value '%s': %v", d.Val(), err)
+				}
+				h.StreamCloseDelay = caddy.Duration(dur)
+			}
 
 		case "trusted_proxies":
 			for d.NextArg() {
 				if d.Val() == "private_ranges" {
-					h.TrustedProxies = append(h.TrustedProxies, caddyhttp.PrivateRangesCIDR()...)
+					h.TrustedProxies = append(h.TrustedProxies, internal.PrivateRangesCIDR()...)
 					continue
 				}
 				h.TrustedProxies = append(h.TrustedProxies, d.Val())
@@ -593,7 +721,7 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 
 			switch len(args) {
 			case 1:
-				err = headers.CaddyfileHeaderOp(h.Headers.Request, args[0], "", "")
+				err = headers.CaddyfileHeaderOp(h.Headers.Request, args[0], "", nil)
 			case 2:
 				// some lint checks, I guess
 				if strings.EqualFold(args[0], "host") && (args[1] == "{hostport}" || args[1] == "{http.request.hostport}") {
@@ -608,9 +736,9 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				if strings.EqualFold(args[0], "x-forwarded-host") && (args[1] == "{host}" || args[1] == "{http.request.host}" || args[1] == "{hostport}" || args[1] == "{http.request.hostport}") {
 					caddy.Log().Named("caddyfile").Warn("Unnecessary header_up X-Forwarded-Host: the reverse proxy's default behavior is to pass headers to the upstream")
 				}
-				err = headers.CaddyfileHeaderOp(h.Headers.Request, args[0], args[1], "")
+				err = headers.CaddyfileHeaderOp(h.Headers.Request, args[0], args[1], nil)
 			case 3:
-				err = headers.CaddyfileHeaderOp(h.Headers.Request, args[0], args[1], args[2])
+				err = headers.CaddyfileHeaderOp(h.Headers.Request, args[0], args[1], &args[2])
 			default:
 				return d.ArgErr()
 			}
@@ -631,13 +759,14 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 			}
 			args := d.RemainingArgs()
+
 			switch len(args) {
 			case 1:
-				err = headers.CaddyfileHeaderOp(h.Headers.Response.HeaderOps, args[0], "", "")
+				err = headers.CaddyfileHeaderOp(h.Headers.Response.HeaderOps, args[0], "", nil)
 			case 2:
-				err = headers.CaddyfileHeaderOp(h.Headers.Response.HeaderOps, args[0], args[1], "")
+				err = headers.CaddyfileHeaderOp(h.Headers.Response.HeaderOps, args[0], args[1], nil)
 			case 3:
-				err = headers.CaddyfileHeaderOp(h.Headers.Response.HeaderOps, args[0], args[1], args[2])
+				err = headers.CaddyfileHeaderOp(h.Headers.Response.HeaderOps, args[0], args[1], &args[2])
 			default:
 				return d.ArgErr()
 			}
@@ -718,7 +847,7 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			}
 
 			// make sure there's no block, cause it doesn't make sense
-			if d.NextBlock(1) {
+			if nesting := d.Nesting(); d.NextBlock(nesting) {
 				return d.Errf("cannot define routes for 'replace_status', use 'handle_response' instead.")
 			}
 
@@ -726,6 +855,12 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				h.HandleResponse,
 				responseHandler,
 			)
+
+		case "verbose_logs":
+			if h.VerboseLogs {
+				return d.Err("verbose_logs already specified")
+			}
+			h.VerboseLogs = true
 
 		default:
 			return d.Errf("unrecognized subdirective %s", d.Val())
@@ -845,6 +980,9 @@ func (h *Handler) FinalizeUnmarshalCaddyfile(helper httpcaddyfile.Helper) error 
 //	    read_buffer             <size>
 //	    write_buffer            <size>
 //	    max_response_header     <size>
+//	    network_proxy           <module> {
+//	        ...
+//	    }
 //	    dial_timeout            <duration>
 //	    dial_fallback_delay     <duration>
 //	    response_header_timeout <duration>
@@ -855,6 +993,9 @@ func (h *Handler) FinalizeUnmarshalCaddyfile(helper httpcaddyfile.Helper) error 
 //	    tls_insecure_skip_verify
 //	    tls_timeout <duration>
 //	    tls_trusted_ca_certs <cert_files...>
+//	    tls_trust_pool <module> {
+//	        ...
+//	    }
 //	    tls_server_name <sni>
 //	    tls_renegotiation <level>
 //	    tls_except_ports <ports...>
@@ -868,287 +1009,349 @@ func (h *Handler) FinalizeUnmarshalCaddyfile(helper httpcaddyfile.Helper) error 
 //	    max_idle_conns_per_host <count>
 //	}
 func (h *HTTPTransport) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for d.Next() {
-		for d.NextBlock(0) {
-			switch d.Val() {
-			case "read_buffer":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				size, err := humanize.ParseBytes(d.Val())
-				if err != nil {
-					return d.Errf("invalid read buffer size '%s': %v", d.Val(), err)
-				}
-				h.ReadBufferSize = int(size)
+	d.Next() // consume transport name
+	for d.NextBlock(0) {
+		switch d.Val() {
+		case "read_buffer":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			size, err := humanize.ParseBytes(d.Val())
+			if err != nil {
+				return d.Errf("invalid read buffer size '%s': %v", d.Val(), err)
+			}
+			h.ReadBufferSize = int(size)
 
-			case "write_buffer":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				size, err := humanize.ParseBytes(d.Val())
-				if err != nil {
-					return d.Errf("invalid write buffer size '%s': %v", d.Val(), err)
-				}
-				h.WriteBufferSize = int(size)
+		case "write_buffer":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			size, err := humanize.ParseBytes(d.Val())
+			if err != nil {
+				return d.Errf("invalid write buffer size '%s': %v", d.Val(), err)
+			}
+			h.WriteBufferSize = int(size)
 
-			case "read_timeout":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				timeout, err := caddy.ParseDuration(d.Val())
-				if err != nil {
-					return d.Errf("invalid read timeout duration '%s': %v", d.Val(), err)
-				}
-				h.ReadTimeout = caddy.Duration(timeout)
+		case "read_timeout":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			timeout, err := caddy.ParseDuration(d.Val())
+			if err != nil {
+				return d.Errf("invalid read timeout duration '%s': %v", d.Val(), err)
+			}
+			h.ReadTimeout = caddy.Duration(timeout)
 
-			case "write_timeout":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				timeout, err := caddy.ParseDuration(d.Val())
-				if err != nil {
-					return d.Errf("invalid write timeout duration '%s': %v", d.Val(), err)
-				}
-				h.WriteTimeout = caddy.Duration(timeout)
+		case "write_timeout":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			timeout, err := caddy.ParseDuration(d.Val())
+			if err != nil {
+				return d.Errf("invalid write timeout duration '%s': %v", d.Val(), err)
+			}
+			h.WriteTimeout = caddy.Duration(timeout)
 
-			case "max_response_header":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				size, err := humanize.ParseBytes(d.Val())
-				if err != nil {
-					return d.Errf("invalid max response header size '%s': %v", d.Val(), err)
-				}
-				h.MaxResponseHeaderSize = int64(size)
+		case "max_response_header":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			size, err := humanize.ParseBytes(d.Val())
+			if err != nil {
+				return d.Errf("invalid max response header size '%s': %v", d.Val(), err)
+			}
+			h.MaxResponseHeaderSize = int64(size)
 
-			case "proxy_protocol":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				switch proxyProtocol := d.Val(); proxyProtocol {
-				case "v1", "v2":
-					h.ProxyProtocol = proxyProtocol
-				default:
-					return d.Errf("invalid proxy protocol version '%s'", proxyProtocol)
-				}
+		case "proxy_protocol":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			switch proxyProtocol := d.Val(); proxyProtocol {
+			case "v1", "v2":
+				h.ProxyProtocol = proxyProtocol
+			default:
+				return d.Errf("invalid proxy protocol version '%s'", proxyProtocol)
+			}
 
-			case "dial_timeout":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				dur, err := caddy.ParseDuration(d.Val())
-				if err != nil {
-					return d.Errf("bad timeout value '%s': %v", d.Val(), err)
-				}
-				h.DialTimeout = caddy.Duration(dur)
+		case "forward_proxy_url":
+			caddy.Log().Warn("The 'forward_proxy_url' field is deprecated. Use 'network_proxy <url>' instead.")
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			u := network.ProxyFromURL{URL: d.Val()}
+			h.NetworkProxyRaw = caddyconfig.JSONModuleObject(u, "from", "url", nil)
 
-			case "dial_fallback_delay":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				dur, err := caddy.ParseDuration(d.Val())
-				if err != nil {
-					return d.Errf("bad fallback delay value '%s': %v", d.Val(), err)
-				}
-				h.FallbackDelay = caddy.Duration(dur)
+		case "network_proxy":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			modStem := d.Val()
+			modID := "caddy.network_proxy." + modStem
+			unm, err := caddyfile.UnmarshalModule(d, modID)
+			if err != nil {
+				return err
+			}
+			h.NetworkProxyRaw = caddyconfig.JSONModuleObject(unm, "from", modStem, nil)
 
-			case "response_header_timeout":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				dur, err := caddy.ParseDuration(d.Val())
-				if err != nil {
-					return d.Errf("bad timeout value '%s': %v", d.Val(), err)
-				}
-				h.ResponseHeaderTimeout = caddy.Duration(dur)
+		case "dial_timeout":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			dur, err := caddy.ParseDuration(d.Val())
+			if err != nil {
+				return d.Errf("bad timeout value '%s': %v", d.Val(), err)
+			}
+			h.DialTimeout = caddy.Duration(dur)
 
-			case "expect_continue_timeout":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				dur, err := caddy.ParseDuration(d.Val())
-				if err != nil {
-					return d.Errf("bad timeout value '%s': %v", d.Val(), err)
-				}
-				h.ExpectContinueTimeout = caddy.Duration(dur)
+		case "dial_fallback_delay":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			dur, err := caddy.ParseDuration(d.Val())
+			if err != nil {
+				return d.Errf("bad fallback delay value '%s': %v", d.Val(), err)
+			}
+			h.FallbackDelay = caddy.Duration(dur)
 
-			case "resolvers":
-				if h.Resolver == nil {
-					h.Resolver = new(UpstreamResolver)
-				}
-				h.Resolver.Addresses = d.RemainingArgs()
-				if len(h.Resolver.Addresses) == 0 {
-					return d.Errf("must specify at least one resolver address")
-				}
+		case "response_header_timeout":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			dur, err := caddy.ParseDuration(d.Val())
+			if err != nil {
+				return d.Errf("bad timeout value '%s': %v", d.Val(), err)
+			}
+			h.ResponseHeaderTimeout = caddy.Duration(dur)
 
-			case "tls":
-				if h.TLS == nil {
-					h.TLS = new(TLSConfig)
-				}
+		case "expect_continue_timeout":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			dur, err := caddy.ParseDuration(d.Val())
+			if err != nil {
+				return d.Errf("bad timeout value '%s': %v", d.Val(), err)
+			}
+			h.ExpectContinueTimeout = caddy.Duration(dur)
 
-			case "tls_client_auth":
-				if h.TLS == nil {
-					h.TLS = new(TLSConfig)
-				}
-				args := d.RemainingArgs()
-				switch len(args) {
-				case 1:
-					h.TLS.ClientCertificateAutomate = args[0]
-				case 2:
-					h.TLS.ClientCertificateFile = args[0]
-					h.TLS.ClientCertificateKeyFile = args[1]
-				default:
-					return d.ArgErr()
-				}
+		case "resolvers":
+			if h.Resolver == nil {
+				h.Resolver = new(UpstreamResolver)
+			}
+			h.Resolver.Addresses = d.RemainingArgs()
+			if len(h.Resolver.Addresses) == 0 {
+				return d.Errf("must specify at least one resolver address")
+			}
 
-			case "tls_insecure_skip_verify":
-				if d.NextArg() {
-					return d.ArgErr()
-				}
-				if h.TLS == nil {
-					h.TLS = new(TLSConfig)
-				}
-				h.TLS.InsecureSkipVerify = true
+		case "tls":
+			if h.TLS == nil {
+				h.TLS = new(TLSConfig)
+			}
 
-			case "tls_timeout":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				dur, err := caddy.ParseDuration(d.Val())
-				if err != nil {
-					return d.Errf("bad timeout value '%s': %v", d.Val(), err)
-				}
-				if h.TLS == nil {
-					h.TLS = new(TLSConfig)
-				}
-				h.TLS.HandshakeTimeout = caddy.Duration(dur)
+		case "tls_client_auth":
+			if h.TLS == nil {
+				h.TLS = new(TLSConfig)
+			}
+			args := d.RemainingArgs()
+			switch len(args) {
+			case 1:
+				h.TLS.ClientCertificateAutomate = args[0]
+			case 2:
+				h.TLS.ClientCertificateFile = args[0]
+				h.TLS.ClientCertificateKeyFile = args[1]
+			default:
+				return d.ArgErr()
+			}
 
-			case "tls_trusted_ca_certs":
-				args := d.RemainingArgs()
-				if len(args) == 0 {
-					return d.ArgErr()
-				}
-				if h.TLS == nil {
-					h.TLS = new(TLSConfig)
-				}
-				h.TLS.RootCAPEMFiles = args
+		case "tls_insecure_skip_verify":
+			if d.NextArg() {
+				return d.ArgErr()
+			}
+			if h.TLS == nil {
+				h.TLS = new(TLSConfig)
+			}
+			h.TLS.InsecureSkipVerify = true
 
-			case "tls_server_name":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				if h.TLS == nil {
-					h.TLS = new(TLSConfig)
-				}
-				h.TLS.ServerName = d.Val()
+		case "tls_curves":
+			args := d.RemainingArgs()
+			if len(args) == 0 {
+				return d.ArgErr()
+			}
+			if h.TLS == nil {
+				h.TLS = new(TLSConfig)
+			}
+			h.TLS.Curves = args
 
-			case "tls_renegotiation":
-				if h.TLS == nil {
-					h.TLS = new(TLSConfig)
-				}
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				switch renegotiation := d.Val(); renegotiation {
-				case "never", "once", "freely":
-					h.TLS.Renegotiation = renegotiation
-				default:
-					return d.ArgErr()
-				}
+		case "tls_timeout":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			dur, err := caddy.ParseDuration(d.Val())
+			if err != nil {
+				return d.Errf("bad timeout value '%s': %v", d.Val(), err)
+			}
+			if h.TLS == nil {
+				h.TLS = new(TLSConfig)
+			}
+			h.TLS.HandshakeTimeout = caddy.Duration(dur)
 
-			case "tls_except_ports":
-				if h.TLS == nil {
-					h.TLS = new(TLSConfig)
-				}
-				h.TLS.ExceptPorts = d.RemainingArgs()
-				if len(h.TLS.ExceptPorts) == 0 {
-					return d.ArgErr()
-				}
+		case "tls_trusted_ca_certs":
+			caddy.Log().Warn("The 'tls_trusted_ca_certs' field is deprecated. Use the 'tls_trust_pool' field instead.")
+			args := d.RemainingArgs()
+			if len(args) == 0 {
+				return d.ArgErr()
+			}
+			if h.TLS == nil {
+				h.TLS = new(TLSConfig)
+			}
+			if len(h.TLS.CARaw) != 0 {
+				return d.Err("cannot specify both 'tls_trust_pool' and 'tls_trusted_ca_certs")
+			}
+			h.TLS.RootCAPEMFiles = args
 
-			case "keepalive":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				if h.KeepAlive == nil {
-					h.KeepAlive = new(KeepAlive)
-				}
+		case "tls_server_name":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			if h.TLS == nil {
+				h.TLS = new(TLSConfig)
+			}
+			h.TLS.ServerName = d.Val()
+
+		case "tls_renegotiation":
+			if h.TLS == nil {
+				h.TLS = new(TLSConfig)
+			}
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			switch renegotiation := d.Val(); renegotiation {
+			case "never", "once", "freely":
+				h.TLS.Renegotiation = renegotiation
+			default:
+				return d.ArgErr()
+			}
+
+		case "tls_except_ports":
+			if h.TLS == nil {
+				h.TLS = new(TLSConfig)
+			}
+			h.TLS.ExceptPorts = d.RemainingArgs()
+			if len(h.TLS.ExceptPorts) == 0 {
+				return d.ArgErr()
+			}
+
+		case "keepalive":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			if h.KeepAlive == nil {
+				h.KeepAlive = new(KeepAlive)
+			}
+			if d.Val() == "off" {
+				var disable bool
+				h.KeepAlive.Enabled = &disable
+				break
+			}
+			dur, err := caddy.ParseDuration(d.Val())
+			if err != nil {
+				return d.Errf("bad duration value '%s': %v", d.Val(), err)
+			}
+			h.KeepAlive.IdleConnTimeout = caddy.Duration(dur)
+
+		case "keepalive_interval":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			dur, err := caddy.ParseDuration(d.Val())
+			if err != nil {
+				return d.Errf("bad interval value '%s': %v", d.Val(), err)
+			}
+			if h.KeepAlive == nil {
+				h.KeepAlive = new(KeepAlive)
+			}
+			h.KeepAlive.ProbeInterval = caddy.Duration(dur)
+
+		case "keepalive_idle_conns":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			num, err := strconv.Atoi(d.Val())
+			if err != nil {
+				return d.Errf("bad integer value '%s': %v", d.Val(), err)
+			}
+			if h.KeepAlive == nil {
+				h.KeepAlive = new(KeepAlive)
+			}
+			h.KeepAlive.MaxIdleConns = num
+
+		case "keepalive_idle_conns_per_host":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			num, err := strconv.Atoi(d.Val())
+			if err != nil {
+				return d.Errf("bad integer value '%s': %v", d.Val(), err)
+			}
+			if h.KeepAlive == nil {
+				h.KeepAlive = new(KeepAlive)
+			}
+			h.KeepAlive.MaxIdleConnsPerHost = num
+
+		case "versions":
+			h.Versions = d.RemainingArgs()
+			if len(h.Versions) == 0 {
+				return d.ArgErr()
+			}
+
+		case "compression":
+			if d.NextArg() {
 				if d.Val() == "off" {
 					var disable bool
-					h.KeepAlive.Enabled = &disable
-					break
+					h.Compression = &disable
 				}
-				dur, err := caddy.ParseDuration(d.Val())
-				if err != nil {
-					return d.Errf("bad duration value '%s': %v", d.Val(), err)
-				}
-				h.KeepAlive.IdleConnTimeout = caddy.Duration(dur)
-
-			case "keepalive_interval":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				dur, err := caddy.ParseDuration(d.Val())
-				if err != nil {
-					return d.Errf("bad interval value '%s': %v", d.Val(), err)
-				}
-				if h.KeepAlive == nil {
-					h.KeepAlive = new(KeepAlive)
-				}
-				h.KeepAlive.ProbeInterval = caddy.Duration(dur)
-
-			case "keepalive_idle_conns":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				num, err := strconv.Atoi(d.Val())
-				if err != nil {
-					return d.Errf("bad integer value '%s': %v", d.Val(), err)
-				}
-				if h.KeepAlive == nil {
-					h.KeepAlive = new(KeepAlive)
-				}
-				h.KeepAlive.MaxIdleConns = num
-
-			case "keepalive_idle_conns_per_host":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				num, err := strconv.Atoi(d.Val())
-				if err != nil {
-					return d.Errf("bad integer value '%s': %v", d.Val(), err)
-				}
-				if h.KeepAlive == nil {
-					h.KeepAlive = new(KeepAlive)
-				}
-				h.KeepAlive.MaxIdleConnsPerHost = num
-
-			case "versions":
-				h.Versions = d.RemainingArgs()
-				if len(h.Versions) == 0 {
-					return d.ArgErr()
-				}
-
-			case "compression":
-				if d.NextArg() {
-					if d.Val() == "off" {
-						var disable bool
-						h.Compression = &disable
-					}
-				}
-
-			case "max_conns_per_host":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				num, err := strconv.Atoi(d.Val())
-				if err != nil {
-					return d.Errf("bad integer value '%s': %v", d.Val(), err)
-				}
-				h.MaxConnsPerHost = num
-
-			default:
-				return d.Errf("unrecognized subdirective %s", d.Val())
 			}
+
+		case "max_conns_per_host":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			num, err := strconv.Atoi(d.Val())
+			if err != nil {
+				return d.Errf("bad integer value '%s': %v", d.Val(), err)
+			}
+			h.MaxConnsPerHost = num
+
+		case "tls_trust_pool":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			modStem := d.Val()
+			modID := "tls.ca_pool.source." + modStem
+			unm, err := caddyfile.UnmarshalModule(d, modID)
+			if err != nil {
+				return err
+			}
+			ca, ok := unm.(caddytls.CA)
+			if !ok {
+				return d.Errf("module %s is not a caddytls.CA", modID)
+			}
+			if h.TLS == nil {
+				h.TLS = new(TLSConfig)
+			}
+			if len(h.TLS.RootCAPEMFiles) != 0 {
+				return d.Err("cannot specify both 'tls_trust_pool' and 'tls_trusted_ca_certs'")
+			}
+			if h.TLS.CARaw != nil {
+				return d.Err("cannot specify \"tls_trust_pool\" twice in caddyfile")
+			}
+			h.TLS.CARaw = caddyconfig.JSONModuleObject(ca, "provider", modStem, nil)
+		case "local_address":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			h.LocalAddress = d.Val()
+		default:
+			return d.Errf("unrecognized subdirective %s", d.Val())
 		}
 	}
 	return nil
@@ -1169,25 +1372,25 @@ func parseCopyResponseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHan
 //	    status <status>
 //	}
 func (h *CopyResponseHandler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for d.Next() {
-		args := d.RemainingArgs()
-		if len(args) == 1 {
-			if num, err := strconv.Atoi(args[0]); err == nil && num > 0 {
-				h.StatusCode = caddyhttp.WeakString(args[0])
-				break
-			}
-		}
+	d.Next() // consume directive name
 
-		for d.NextBlock(0) {
-			switch d.Val() {
-			case "status":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				h.StatusCode = caddyhttp.WeakString(d.Val())
-			default:
-				return d.Errf("unrecognized subdirective '%s'", d.Val())
+	args := d.RemainingArgs()
+	if len(args) == 1 {
+		if num, err := strconv.Atoi(args[0]); err == nil && num > 0 {
+			h.StatusCode = caddyhttp.WeakString(args[0])
+			return nil
+		}
+	}
+
+	for d.NextBlock(0) {
+		switch d.Val() {
+		case "status":
+			if !d.NextArg() {
+				return d.ArgErr()
 			}
+			h.StatusCode = caddyhttp.WeakString(d.Val())
+		default:
+			return d.Errf("unrecognized subdirective '%s'", d.Val())
 		}
 	}
 	return nil
@@ -1209,23 +1412,23 @@ func parseCopyResponseHeadersCaddyfile(h httpcaddyfile.Helper) (caddyhttp.Middle
 //	    exclude <fields...>
 //	}
 func (h *CopyResponseHeadersHandler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for d.Next() {
-		args := d.RemainingArgs()
-		if len(args) > 0 {
-			return d.ArgErr()
-		}
+	d.Next() // consume directive name
 
-		for d.NextBlock(0) {
-			switch d.Val() {
-			case "include":
-				h.Include = append(h.Include, d.RemainingArgs()...)
+	args := d.RemainingArgs()
+	if len(args) > 0 {
+		return d.ArgErr()
+	}
 
-			case "exclude":
-				h.Exclude = append(h.Exclude, d.RemainingArgs()...)
+	for d.NextBlock(0) {
+		switch d.Val() {
+		case "include":
+			h.Include = append(h.Include, d.RemainingArgs()...)
 
-			default:
-				return d.Errf("unrecognized subdirective '%s'", d.Val())
-			}
+		case "exclude":
+			h.Exclude = append(h.Exclude, d.RemainingArgs()...)
+
+		default:
+			return d.Errf("unrecognized subdirective '%s'", d.Val())
 		}
 	}
 	return nil
@@ -1241,91 +1444,99 @@ func (h *CopyResponseHeadersHandler) UnmarshalCaddyfile(d *caddyfile.Dispenser) 
 //	    resolvers           <resolvers...>
 //	    dial_timeout        <timeout>
 //	    dial_fallback_delay <timeout>
+//	    grace_period        <duration>
 //	}
 func (u *SRVUpstreams) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for d.Next() {
-		args := d.RemainingArgs()
-		if len(args) > 1 {
-			return d.ArgErr()
-		}
-		if len(args) > 0 {
-			u.Name = args[0]
-		}
+	d.Next() // consume upstream source name
 
-		for d.NextBlock(0) {
-			switch d.Val() {
-			case "service":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				if u.Service != "" {
-					return d.Errf("srv service has already been specified")
-				}
-				u.Service = d.Val()
-
-			case "proto":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				if u.Proto != "" {
-					return d.Errf("srv proto has already been specified")
-				}
-				u.Proto = d.Val()
-
-			case "name":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				if u.Name != "" {
-					return d.Errf("srv name has already been specified")
-				}
-				u.Name = d.Val()
-
-			case "refresh":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				dur, err := caddy.ParseDuration(d.Val())
-				if err != nil {
-					return d.Errf("parsing refresh interval duration: %v", err)
-				}
-				u.Refresh = caddy.Duration(dur)
-
-			case "resolvers":
-				if u.Resolver == nil {
-					u.Resolver = new(UpstreamResolver)
-				}
-				u.Resolver.Addresses = d.RemainingArgs()
-				if len(u.Resolver.Addresses) == 0 {
-					return d.Errf("must specify at least one resolver address")
-				}
-
-			case "dial_timeout":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				dur, err := caddy.ParseDuration(d.Val())
-				if err != nil {
-					return d.Errf("bad timeout value '%s': %v", d.Val(), err)
-				}
-				u.DialTimeout = caddy.Duration(dur)
-
-			case "dial_fallback_delay":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				dur, err := caddy.ParseDuration(d.Val())
-				if err != nil {
-					return d.Errf("bad delay value '%s': %v", d.Val(), err)
-				}
-				u.FallbackDelay = caddy.Duration(dur)
-
-			default:
-				return d.Errf("unrecognized srv option '%s'", d.Val())
-			}
-		}
+	args := d.RemainingArgs()
+	if len(args) > 1 {
+		return d.ArgErr()
+	}
+	if len(args) > 0 {
+		u.Name = args[0]
 	}
 
+	for d.NextBlock(0) {
+		switch d.Val() {
+		case "service":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			if u.Service != "" {
+				return d.Errf("srv service has already been specified")
+			}
+			u.Service = d.Val()
+
+		case "proto":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			if u.Proto != "" {
+				return d.Errf("srv proto has already been specified")
+			}
+			u.Proto = d.Val()
+
+		case "name":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			if u.Name != "" {
+				return d.Errf("srv name has already been specified")
+			}
+			u.Name = d.Val()
+
+		case "refresh":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			dur, err := caddy.ParseDuration(d.Val())
+			if err != nil {
+				return d.Errf("parsing refresh interval duration: %v", err)
+			}
+			u.Refresh = caddy.Duration(dur)
+
+		case "resolvers":
+			if u.Resolver == nil {
+				u.Resolver = new(UpstreamResolver)
+			}
+			u.Resolver.Addresses = d.RemainingArgs()
+			if len(u.Resolver.Addresses) == 0 {
+				return d.Errf("must specify at least one resolver address")
+			}
+
+		case "dial_timeout":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			dur, err := caddy.ParseDuration(d.Val())
+			if err != nil {
+				return d.Errf("bad timeout value '%s': %v", d.Val(), err)
+			}
+			u.DialTimeout = caddy.Duration(dur)
+
+		case "dial_fallback_delay":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			dur, err := caddy.ParseDuration(d.Val())
+			if err != nil {
+				return d.Errf("bad delay value '%s': %v", d.Val(), err)
+			}
+			u.FallbackDelay = caddy.Duration(dur)
+		case "grace_period":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			dur, err := caddy.ParseDuration(d.Val())
+			if err != nil {
+				return d.Errf("bad grace period value '%s': %v", d.Val(), err)
+			}
+			u.GracePeriod = caddy.Duration(dur)
+		default:
+			return d.Errf("unrecognized srv option '%s'", d.Val())
+		}
+	}
 	return nil
 }
 
@@ -1341,105 +1552,104 @@ func (u *SRVUpstreams) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 //	    versions            ipv4|ipv6
 //	}
 func (u *AUpstreams) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for d.Next() {
-		args := d.RemainingArgs()
-		if len(args) > 2 {
-			return d.ArgErr()
-		}
-		if len(args) > 0 {
-			u.Name = args[0]
-			if len(args) == 2 {
-				u.Port = args[1]
-			}
-		}
+	d.Next() // consume upstream source name
 
-		for d.NextBlock(0) {
-			switch d.Val() {
-			case "name":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				if u.Name != "" {
-					return d.Errf("a name has already been specified")
-				}
-				u.Name = d.Val()
-
-			case "port":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				if u.Port != "" {
-					return d.Errf("a port has already been specified")
-				}
-				u.Port = d.Val()
-
-			case "refresh":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				dur, err := caddy.ParseDuration(d.Val())
-				if err != nil {
-					return d.Errf("parsing refresh interval duration: %v", err)
-				}
-				u.Refresh = caddy.Duration(dur)
-
-			case "resolvers":
-				if u.Resolver == nil {
-					u.Resolver = new(UpstreamResolver)
-				}
-				u.Resolver.Addresses = d.RemainingArgs()
-				if len(u.Resolver.Addresses) == 0 {
-					return d.Errf("must specify at least one resolver address")
-				}
-
-			case "dial_timeout":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				dur, err := caddy.ParseDuration(d.Val())
-				if err != nil {
-					return d.Errf("bad timeout value '%s': %v", d.Val(), err)
-				}
-				u.DialTimeout = caddy.Duration(dur)
-
-			case "dial_fallback_delay":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				dur, err := caddy.ParseDuration(d.Val())
-				if err != nil {
-					return d.Errf("bad delay value '%s': %v", d.Val(), err)
-				}
-				u.FallbackDelay = caddy.Duration(dur)
-
-			case "versions":
-				args := d.RemainingArgs()
-				if len(args) == 0 {
-					return d.Errf("must specify at least one version")
-				}
-
-				if u.Versions == nil {
-					u.Versions = &ipVersions{}
-				}
-
-				trueBool := true
-				for _, arg := range args {
-					switch arg {
-					case "ipv4":
-						u.Versions.IPv4 = &trueBool
-					case "ipv6":
-						u.Versions.IPv6 = &trueBool
-					default:
-						return d.Errf("unsupported version: '%s'", arg)
-					}
-				}
-
-			default:
-				return d.Errf("unrecognized a option '%s'", d.Val())
-			}
+	args := d.RemainingArgs()
+	if len(args) > 2 {
+		return d.ArgErr()
+	}
+	if len(args) > 0 {
+		u.Name = args[0]
+		if len(args) == 2 {
+			u.Port = args[1]
 		}
 	}
 
+	for d.NextBlock(0) {
+		switch d.Val() {
+		case "name":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			if u.Name != "" {
+				return d.Errf("a name has already been specified")
+			}
+			u.Name = d.Val()
+
+		case "port":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			if u.Port != "" {
+				return d.Errf("a port has already been specified")
+			}
+			u.Port = d.Val()
+
+		case "refresh":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			dur, err := caddy.ParseDuration(d.Val())
+			if err != nil {
+				return d.Errf("parsing refresh interval duration: %v", err)
+			}
+			u.Refresh = caddy.Duration(dur)
+
+		case "resolvers":
+			if u.Resolver == nil {
+				u.Resolver = new(UpstreamResolver)
+			}
+			u.Resolver.Addresses = d.RemainingArgs()
+			if len(u.Resolver.Addresses) == 0 {
+				return d.Errf("must specify at least one resolver address")
+			}
+
+		case "dial_timeout":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			dur, err := caddy.ParseDuration(d.Val())
+			if err != nil {
+				return d.Errf("bad timeout value '%s': %v", d.Val(), err)
+			}
+			u.DialTimeout = caddy.Duration(dur)
+
+		case "dial_fallback_delay":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			dur, err := caddy.ParseDuration(d.Val())
+			if err != nil {
+				return d.Errf("bad delay value '%s': %v", d.Val(), err)
+			}
+			u.FallbackDelay = caddy.Duration(dur)
+
+		case "versions":
+			args := d.RemainingArgs()
+			if len(args) == 0 {
+				return d.Errf("must specify at least one version")
+			}
+
+			if u.Versions == nil {
+				u.Versions = &IPVersions{}
+			}
+
+			trueBool := true
+			for _, arg := range args {
+				switch arg {
+				case "ipv4":
+					u.Versions.IPv4 = &trueBool
+				case "ipv6":
+					u.Versions.IPv6 = &trueBool
+				default:
+					return d.Errf("unsupported version: '%s'", arg)
+				}
+			}
+
+		default:
+			return d.Errf("unrecognized a option '%s'", d.Val())
+		}
+	}
 	return nil
 }
 
@@ -1449,26 +1659,25 @@ func (u *AUpstreams) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 //	    <source> [...]
 //	}
 func (u *MultiUpstreams) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for d.Next() {
-		if d.NextArg() {
-			return d.ArgErr()
-		}
+	d.Next() // consume upstream source name
 
-		for nesting := d.Nesting(); d.NextBlock(nesting); {
-			dynModule := d.Val()
-			modID := "http.reverse_proxy.upstreams." + dynModule
-			unm, err := caddyfile.UnmarshalModule(d, modID)
-			if err != nil {
-				return err
-			}
-			source, ok := unm.(UpstreamSource)
-			if !ok {
-				return d.Errf("module %s (%T) is not an UpstreamSource", modID, unm)
-			}
-			u.SourcesRaw = append(u.SourcesRaw, caddyconfig.JSONModuleObject(source, "source", dynModule, nil))
-		}
+	if d.NextArg() {
+		return d.ArgErr()
 	}
 
+	for d.NextBlock(0) {
+		dynModule := d.Val()
+		modID := "http.reverse_proxy.upstreams." + dynModule
+		unm, err := caddyfile.UnmarshalModule(d, modID)
+		if err != nil {
+			return err
+		}
+		source, ok := unm.(UpstreamSource)
+		if !ok {
+			return d.Errf("module %s (%T) is not an UpstreamSource", modID, unm)
+		}
+		u.SourcesRaw = append(u.SourcesRaw, caddyconfig.JSONModuleObject(source, "source", dynModule, nil))
+	}
 	return nil
 }
 

@@ -19,6 +19,7 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -27,27 +28,57 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"text/tabwriter"
 	"text/template"
+	"time"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp/templates"
-	"go.uber.org/zap"
 )
 
+// BrowseTemplate is the default template document to use for
+// file listings. By default, its default value is an embedded
+// document. You can override this value at program start, or
+// if you are running Caddy via config, you can specify a
+// custom template_file in the browse configuration.
+//
 //go:embed browse.html
-var defaultBrowseTemplate string
+var BrowseTemplate string
 
 // Browse configures directory browsing.
 type Browse struct {
-	// Use this template file instead of the default browse template.
+	// Filename of the template to use instead of the embedded browse template.
 	TemplateFile string `json:"template_file,omitempty"`
+
+	// Determines whether or not targets of symlinks should be revealed.
+	RevealSymlinks bool `json:"reveal_symlinks,omitempty"`
+
+	// Override the default sort.
+	// It includes the following options:
+	//   - sort_by: name(default), namedirfirst, size, time
+	//   - order: asc(default), desc
+	// eg.:
+	//   - `sort time desc` will sort by time in descending order
+	//   - `sort size` will sort by size in ascending order
+	// The first option must be `sort_by` and the second option must be `order` (if exists).
+	SortOptions []string `json:"sort,omitempty"`
+
+	// FileLimit limits the number of up to n DirEntry values in directory order.
+	FileLimit int `json:"file_limit,omitempty"`
 }
 
-func (fsrv *FileServer) serveBrowse(root, dirPath string, w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	fsrv.logger.Debug("browse enabled; listing directory contents",
-		zap.String("path", dirPath),
-		zap.String("root", root))
+const (
+	defaultDirEntryLimit = 10000
+)
+
+func (fsrv *FileServer) serveBrowse(fileSystem fs.FS, root, dirPath string, w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	if c := fsrv.logger.Check(zapcore.DebugLevel, "browse enabled; listing directory contents"); c != nil {
+		c.Write(zap.String("path", dirPath), zap.String("root", root))
+	}
 
 	// Navigation on the client-side gets messed up if the
 	// URL doesn't end in a trailing slash because hrefs to
@@ -69,12 +100,14 @@ func (fsrv *FileServer) serveBrowse(root, dirPath string, w http.ResponseWriter,
 	origReq := r.Context().Value(caddyhttp.OriginalRequestCtxKey).(http.Request)
 	if r.URL.Path == "" || path.Base(origReq.URL.Path) == path.Base(r.URL.Path) {
 		if !strings.HasSuffix(origReq.URL.Path, "/") {
-			fsrv.logger.Debug("redirecting to trailing slash to preserve hrefs", zap.String("request_path", r.URL.Path))
+			if c := fsrv.logger.Check(zapcore.DebugLevel, "redirecting to trailing slash to preserve hrefs"); c != nil {
+				c.Write(zap.String("request_path", r.URL.Path))
+			}
 			return redirect(w, r, origReq.URL.Path+"/")
 		}
 	}
 
-	dir, err := fsrv.openFile(dirPath, w)
+	dir, err := fsrv.openFile(fileSystem, dirPath, w)
 	if err != nil {
 		return err
 	}
@@ -83,14 +116,26 @@ func (fsrv *FileServer) serveBrowse(root, dirPath string, w http.ResponseWriter,
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 
 	// TODO: not entirely sure if path.Clean() is necessary here but seems like a safe plan (i.e. /%2e%2e%2f) - someone could verify this
-	listing, err := fsrv.loadDirectoryContents(r.Context(), dir.(fs.ReadDirFile), root, path.Clean(r.URL.EscapedPath()), repl)
+	listing, err := fsrv.loadDirectoryContents(r.Context(), fileSystem, dir.(fs.ReadDirFile), root, path.Clean(r.URL.EscapedPath()), repl)
 	switch {
-	case os.IsPermission(err):
+	case errors.Is(err, fs.ErrPermission):
 		return caddyhttp.Error(http.StatusForbidden, err)
-	case os.IsNotExist(err):
+	case errors.Is(err, fs.ErrNotExist):
 		return fsrv.notFound(w, r, next)
 	case err != nil:
 		return caddyhttp.Error(http.StatusInternalServerError, err)
+	}
+
+	w.Header().Add("Vary", "Accept, Accept-Encoding")
+
+	// speed up browser/client experience and caching by supporting If-Modified-Since
+	if ifModSinceStr := r.Header.Get("If-Modified-Since"); ifModSinceStr != "" {
+		// basically a copy of stdlib file server's handling of If-Modified-Since
+		ifModSince, err := http.ParseTime(ifModSinceStr)
+		if err == nil && listing.lastModified.Truncate(time.Second).Compare(ifModSince) <= 0 {
+			w.WriteHeader(http.StatusNotModified)
+			return nil
+		}
 	}
 
 	fsrv.browseApplyQueryParams(w, r, listing)
@@ -100,20 +145,50 @@ func (fsrv *FileServer) serveBrowse(root, dirPath string, w http.ResponseWriter,
 	defer bufPool.Put(buf)
 
 	acceptHeader := strings.ToLower(strings.Join(r.Header["Accept"], ","))
+	w.Header().Set("Last-Modified", listing.lastModified.Format(http.TimeFormat))
 
-	// write response as either JSON or HTML
-	if strings.Contains(acceptHeader, "application/json") {
+	switch {
+	case strings.Contains(acceptHeader, "application/json"):
 		if err := json.NewEncoder(buf).Encode(listing.Items); err != nil {
 			return caddyhttp.Error(http.StatusInternalServerError, err)
 		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	} else {
+
+	case strings.Contains(acceptHeader, "text/plain"):
+		writer := tabwriter.NewWriter(buf, 0, 8, 1, '\t', tabwriter.AlignRight)
+
+		// Header on top
+		if _, err := fmt.Fprintln(writer, "Name\tSize\tModified"); err != nil {
+			return caddyhttp.Error(http.StatusInternalServerError, err)
+		}
+
+		// Lines to separate the header
+		if _, err := fmt.Fprintln(writer, "----\t----\t--------"); err != nil {
+			return caddyhttp.Error(http.StatusInternalServerError, err)
+		}
+
+		// Actual files
+		for _, item := range listing.Items {
+			if _, err := fmt.Fprintf(writer, "%s\t%s\t%s\n",
+				item.Name, item.HumanSize(), item.HumanModTime("January 2, 2006 at 15:04:05"),
+			); err != nil {
+				return caddyhttp.Error(http.StatusInternalServerError, err)
+			}
+		}
+
+		if err := writer.Flush(); err != nil {
+			return caddyhttp.Error(http.StatusInternalServerError, err)
+		}
+
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+
+	default:
 		var fs http.FileSystem
 		if fsrv.Root != "" {
 			fs = http.Dir(repl.ReplaceAll(fsrv.Root, "."))
 		}
 
-		var tplCtx = &templateContext{
+		tplCtx := &templateContext{
 			TemplateContext: templates.TemplateContext{
 				Root:       fs,
 				Req:        r,
@@ -137,8 +212,17 @@ func (fsrv *FileServer) serveBrowse(root, dirPath string, w http.ResponseWriter,
 	return nil
 }
 
-func (fsrv *FileServer) loadDirectoryContents(ctx context.Context, dir fs.ReadDirFile, root, urlPath string, repl *caddy.Replacer) (*browseTemplateContext, error) {
-	files, err := dir.ReadDir(10000) // TODO: this limit should probably be configurable
+func (fsrv *FileServer) loadDirectoryContents(ctx context.Context, fileSystem fs.FS, dir fs.ReadDirFile, root, urlPath string, repl *caddy.Replacer) (*browseTemplateContext, error) {
+	// modTime for the directory itself
+	stat, err := dir.Stat()
+	if err != nil {
+		return nil, err
+	}
+	dirLimit := defaultDirEntryLimit
+	if fsrv.Browse.FileLimit != 0 {
+		dirLimit = fsrv.Browse.FileLimit
+	}
+	files, err := dir.ReadDir(dirLimit)
 	if err != nil && err != io.EOF {
 		return nil, err
 	}
@@ -146,17 +230,40 @@ func (fsrv *FileServer) loadDirectoryContents(ctx context.Context, dir fs.ReadDi
 	// user can presumably browse "up" to parent folder if path is longer than "/"
 	canGoUp := len(urlPath) > 1
 
-	return fsrv.directoryListing(ctx, files, canGoUp, root, urlPath, repl), nil
+	return fsrv.directoryListing(ctx, fileSystem, stat.ModTime(), files, canGoUp, root, urlPath, repl), nil
 }
 
 // browseApplyQueryParams applies query parameters to the listing.
 // It mutates the listing and may set cookies.
 func (fsrv *FileServer) browseApplyQueryParams(w http.ResponseWriter, r *http.Request, listing *browseTemplateContext) {
+	var orderParam, sortParam string
+
+	// The configs in Caddyfile have lower priority than Query params,
+	// so put it at first.
+	for idx, item := range fsrv.Browse.SortOptions {
+		// Only `sort` & `order`, 2 params are allowed
+		if idx >= 2 {
+			break
+		}
+		switch item {
+		case sortByName, sortByNameDirFirst, sortBySize, sortByTime:
+			sortParam = item
+		case sortOrderAsc, sortOrderDesc:
+			orderParam = item
+		}
+	}
+
 	layoutParam := r.URL.Query().Get("layout")
-	sortParam := r.URL.Query().Get("sort")
-	orderParam := r.URL.Query().Get("order")
 	limitParam := r.URL.Query().Get("limit")
 	offsetParam := r.URL.Query().Get("offset")
+	sortParamTmp := r.URL.Query().Get("sort")
+	if sortParamTmp != "" {
+		sortParam = sortParamTmp
+	}
+	orderParamTmp := r.URL.Query().Get("order")
+	if orderParamTmp != "" {
+		orderParam = orderParamTmp
+	}
 
 	switch layoutParam {
 	case "list", "grid", "":
@@ -179,11 +286,11 @@ func (fsrv *FileServer) browseApplyQueryParams(w http.ResponseWriter, r *http.Re
 	// then figure out the order
 	switch orderParam {
 	case "":
-		orderParam = "asc"
+		orderParam = sortOrderAsc
 		if orderCookie, orderErr := r.Cookie("order"); orderErr == nil {
 			orderParam = orderCookie.Value
 		}
-	case "asc", "desc":
+	case sortOrderAsc, sortOrderDesc:
 		http.SetCookie(w, &http.Cookie{Name: "order", Value: orderParam, Secure: r.TLS != nil})
 	}
 
@@ -204,7 +311,7 @@ func (fsrv *FileServer) makeBrowseTemplate(tplCtx *templateContext) (*template.T
 		}
 	} else {
 		tpl = tplCtx.NewTemplate("default_listing")
-		tpl, err = tpl.Parse(defaultBrowseTemplate)
+		tpl, err = tpl.Parse(BrowseTemplate)
 		if err != nil {
 			return nil, fmt.Errorf("parsing default browse template: %v", err)
 		}
@@ -215,12 +322,12 @@ func (fsrv *FileServer) makeBrowseTemplate(tplCtx *templateContext) (*template.T
 
 // isSymlinkTargetDir returns true if f's symbolic link target
 // is a directory.
-func (fsrv *FileServer) isSymlinkTargetDir(f fs.FileInfo, root, urlPath string) bool {
+func (fsrv *FileServer) isSymlinkTargetDir(fileSystem fs.FS, f fs.FileInfo, root, urlPath string) bool {
 	if !isSymlink(f) {
 		return false
 	}
 	target := caddyhttp.SanitizedPathJoin(root, path.Join(urlPath, f.Name()))
-	targetInfo, err := fs.Stat(fsrv.fileSystem, target)
+	targetInfo, err := fs.Stat(fileSystem, target)
 	if err != nil {
 		return false
 	}

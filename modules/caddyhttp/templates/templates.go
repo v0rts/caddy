@@ -23,6 +23,8 @@ import (
 	"strings"
 	"text/template"
 
+	"go.uber.org/zap"
+
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
@@ -46,7 +48,8 @@ func init() {
 //
 // ##### `.Args`
 //
-// A slice of arguments passed to this page/context, for example as the result of a `include`.
+// A slice of arguments passed to this page/context, for example
+// as the result of a [`include`](#include).
 //
 // ```
 // {{index .Args 0}} // first argument
@@ -78,6 +81,12 @@ func init() {
 // {{placeholder "http.error.status_code"}}
 // ```
 //
+// As a shortcut, `ph` is an alias for `placeholder`.
+//
+// ```
+// {{ph "http.request.method"}}
+// ```
+//
 // ##### `.Host`
 //
 // Returns the hostname portion (no port) of the Host header of the HTTP request.
@@ -103,8 +112,8 @@ func init() {
 // Reads and returns the contents of another file, and parses it
 // as a template, adding any template definitions to the template
 // stack. If there are no definitions, the filepath will be the
-// definition name. Any {{ define }} blocks will be accessible by
-// {{ template }} or {{ block }}. Imports must happen before the
+// definition name. Any `{{ define }}` blocks will be accessible by
+// `{{ template }}` or `{{ block }}`. Imports must happen before the
 // template or block action is called. Note that the contents are
 // NOT escaped, so you should only import trusted template files.
 //
@@ -125,12 +134,13 @@ func init() {
 //
 // Includes the contents of another file, rendering it in-place.
 // Optionally can pass key-value pairs as arguments to be accessed
-// by the included file. Note that the contents are NOT escaped,
-// so you should only include trusted template files.
+// by the included file. Use [`.Args N`](#args) to access the N-th
+// argument, 0-indexed. Note that the contents are NOT escaped, so
+// you should only include trusted template files.
 //
 // ```
 // {{include "path/to/file.html"}}  // no arguments
-// {{include "path/to/file.html" "arg1" 2 "value 3"}}  // with arguments
+// {{include "path/to/file.html" "arg0" 1 "value 2"}}  // with arguments
 // ```
 //
 // ##### `readFile`
@@ -145,7 +155,8 @@ func init() {
 //
 // ##### `listFiles`
 //
-// Returns a list of the files in the given directory, which is relative to the template context's file root.
+// Returns a list of the files in the given directory, which is relative
+// to the template context's file root.
 //
 // ```
 // {{listFiles "/mydir"}}
@@ -156,7 +167,7 @@ func init() {
 // Renders the given Markdown text as HTML and returns it. This uses the
 // [Goldmark](https://github.com/yuin/goldmark) library,
 // which is CommonMark compliant. It also has these extensions
-// enabled: Github Flavored Markdown, Footnote, and syntax
+// enabled: GitHub Flavored Markdown, Footnote, and syntax
 // highlighting provided by [Chroma](https://github.com/alecthomas/chroma).
 //
 // ```
@@ -165,10 +176,19 @@ func init() {
 //
 // ##### `.RemoteIP`
 //
-// Returns the client's IP address.
+// Returns the connection's IP address.
 //
 // ```
 // {{.RemoteIP}}
+// ```
+//
+// ##### `.ClientIP`
+//
+// Returns the real client's IP address, if `trusted_proxies` was configured,
+// otherwise returns the connection's IP address.
+//
+// ```
+// {{.ClientIP}}
 // ```
 //
 // ##### `.Req`
@@ -186,7 +206,8 @@ func init() {
 //
 // ##### `.OriginalReq`
 //
-// Like .Req, except it accesses the original HTTP request before rewrites or other internal modifications.
+// Like [`.Req`](#req), except it accesses the original HTTP
+// request before rewrites or other internal modifications.
 //
 // ##### `.RespHeader.Add`
 //
@@ -222,11 +243,13 @@ func init() {
 //
 // ##### `splitFrontMatter`
 //
-// Splits front matter out from the body. Front matter is metadata that appears at the very beginning of a file or string. Front matter can be in YAML, TOML, or JSON formats:
+// Splits front matter out from the body. Front matter is metadata that
+// appears at the very beginning of a file or string. Front matter can
+// be in YAML, TOML, or JSON formats:
 //
 // **TOML** front matter starts and ends with `+++`:
 //
-// ```
+// ```toml
 // +++
 // template = "blog"
 // title = "Blog Homepage"
@@ -236,7 +259,7 @@ func init() {
 //
 // **YAML** is surrounded by `---`:
 //
-// ```
+// ```yaml
 // ---
 // template: blog
 // title: Blog Homepage
@@ -246,14 +269,12 @@ func init() {
 //
 // **JSON** is simply `{` and `}`:
 //
-// ```
-//
-//	{
-//		"template": "blog",
-//		"title": "Blog Homepage",
-//		"sitename": "A Caddy site"
-//	}
-//
+// ```json
+// {
+// "template": "blog",
+// "title": "Blog Homepage",
+// "sitename": "A Caddy site"
+// }
 // ```
 //
 // The resulting front matter will be made available like so:
@@ -285,6 +306,18 @@ func init() {
 // find the documentation on time layouts [in Go's docs](https://pkg.go.dev/time#pkg-constants).
 // The default time layout is `RFC1123Z`, i.e. `Mon, 02 Jan 2006 15:04:05 -0700`.
 //
+// ##### `pathEscape`
+//
+// Passes a string through `url.PathEscape`, replacing characters that have
+// special meaning in URL path parameters (`?`, `&`, `%`).
+//
+// Useful e.g. to include filenames containing these characters in URL path
+// parameters, or use them as an `img` element's `src` attribute.
+//
+// ```
+// {{pathEscape "50%_valid_filename?.jpg"}}
+// ```
+//
 // ```
 // {{humanize "size" "2048000"}}
 // {{placeholder "http.response.header.Content-Length" | humanize "size"}}
@@ -306,10 +339,15 @@ type Templates struct {
 	// the opening and closing delimiters. Default: `["{{", "}}"]`
 	Delimiters []string `json:"delimiters,omitempty"`
 
+	// Extensions adds functions to the template's func map. These often
+	// act as components on web pages, for example.
+	ExtensionsRaw caddy.ModuleMap `json:"match,omitempty" caddy:"namespace=http.handlers.templates.functions"`
+
 	customFuncs []template.FuncMap
+	logger      *zap.Logger
 }
 
-// Customfunctions is the interface for registering custom template functions.
+// CustomFunctions is the interface for registering custom template functions.
 type CustomFunctions interface {
 	// CustomTemplateFunctions should return the mapping from custom function names to implementations.
 	CustomTemplateFunctions() template.FuncMap
@@ -325,17 +363,14 @@ func (Templates) CaddyModule() caddy.ModuleInfo {
 
 // Provision provisions t.
 func (t *Templates) Provision(ctx caddy.Context) error {
-	fnModInfos := caddy.GetModules("http.handlers.templates.functions")
-	customFuncs := make([]template.FuncMap, 0, len(fnModInfos))
-	for _, modInfo := range fnModInfos {
-		mod := modInfo.New()
-		fnMod, ok := mod.(CustomFunctions)
-		if !ok {
-			return fmt.Errorf("module %q does not satisfy the CustomFunctions interface", modInfo.ID)
-		}
-		customFuncs = append(customFuncs, fnMod.CustomTemplateFunctions())
+	t.logger = ctx.Logger()
+	mods, err := ctx.LoadModule(t, "ExtensionsRaw")
+	if err != nil {
+		return fmt.Errorf("loading template extensions: %v", err)
 	}
-	t.customFuncs = customFuncs
+	for _, modIface := range mods.(map[string]any) {
+		t.customFuncs = append(t.customFuncs, modIface.(CustomFunctions).CustomTemplateFunctions())
+	}
 
 	if t.MIMETypes == nil {
 		t.MIMETypes = defaultMIMETypes

@@ -236,6 +236,11 @@ func TestRewrite(t *testing.T) {
 			expect: newRequest(t, "GET", "/foo/bar"),
 		},
 		{
+			rule:   Rewrite{StripPathPrefix: "prefix"},
+			input:  newRequest(t, "GET", "/prefix/foo/bar"),
+			expect: newRequest(t, "GET", "/foo/bar"),
+		},
+		{
 			rule:   Rewrite{StripPathPrefix: "/prefix"},
 			input:  newRequest(t, "GET", "/prefix"),
 			expect: newRequest(t, "GET", ""),
@@ -333,7 +338,7 @@ func TestRewrite(t *testing.T) {
 			input:  newRequest(t, "GET", "/foo/findme%2Fbar"),
 			expect: newRequest(t, "GET", "/foo/replaced%2Fbar"),
 		},
-		
+
 		{
 			rule:   Rewrite{PathRegexp: []*regexReplacer{{Find: "/{2,}", Replace: "/"}}},
 			input:  newRequest(t, "GET", "/foo//bar///baz?a=b//c"),

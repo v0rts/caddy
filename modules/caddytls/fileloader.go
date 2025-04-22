@@ -18,6 +18,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/caddyserver/caddy/v2"
 )
@@ -28,6 +29,26 @@ func init() {
 
 // FileLoader loads certificates and their associated keys from disk.
 type FileLoader []CertKeyFilePair
+
+// Provision implements caddy.Provisioner.
+func (fl FileLoader) Provision(ctx caddy.Context) error {
+	repl, ok := ctx.Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	if !ok {
+		repl = caddy.NewReplacer()
+	}
+	for k, pair := range fl {
+		for i, tag := range pair.Tags {
+			pair.Tags[i] = repl.ReplaceKnown(tag, "")
+		}
+		fl[k] = CertKeyFilePair{
+			Certificate: repl.ReplaceKnown(pair.Certificate, ""),
+			Key:         repl.ReplaceKnown(pair.Key, ""),
+			Format:      repl.ReplaceKnown(pair.Format, ""),
+			Tags:        pair.Tags,
+		}
+	}
+	return nil
+}
 
 // CaddyModule returns the Caddy module information.
 func (FileLoader) CaddyModule() caddy.ModuleInfo {
@@ -72,8 +93,16 @@ func (fl FileLoader) LoadCertificates() ([]Certificate, error) {
 		switch pair.Format {
 		case "":
 			fallthrough
+
 		case "pem":
+			// if the start of the key file looks like an encrypted private key,
+			// reject it with a helpful error message
+			if strings.Contains(string(keyData[:40]), "ENCRYPTED") {
+				return nil, fmt.Errorf("encrypted private keys are not supported; please decrypt the key first")
+			}
+
 			cert, err = tls.X509KeyPair(certData, keyData)
+
 		default:
 			return nil, fmt.Errorf("unrecognized certificate/key encoding format: %s", pair.Format)
 		}
@@ -87,4 +116,7 @@ func (fl FileLoader) LoadCertificates() ([]Certificate, error) {
 }
 
 // Interface guard
-var _ CertificateLoader = (FileLoader)(nil)
+var (
+	_ CertificateLoader = (FileLoader)(nil)
+	_ caddy.Provisioner = (FileLoader)(nil)
+)

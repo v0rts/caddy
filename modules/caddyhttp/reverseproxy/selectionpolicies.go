@@ -20,7 +20,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"hash/fnv"
 	weakrand "math/rand"
 	"net"
 	"net/http"
@@ -28,6 +27,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/cespare/xxhash/v2"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
@@ -40,6 +41,7 @@ func init() {
 	caddy.RegisterModule(RandomChoiceSelection{})
 	caddy.RegisterModule(LeastConnSelection{})
 	caddy.RegisterModule(RoundRobinSelection{})
+	caddy.RegisterModule(WeightedRoundRobinSelection{})
 	caddy.RegisterModule(FirstSelection{})
 	caddy.RegisterModule(IPHashSelection{})
 	caddy.RegisterModule(ClientIPHashSelection{})
@@ -47,8 +49,6 @@ func init() {
 	caddy.RegisterModule(QueryHashSelection{})
 	caddy.RegisterModule(HeaderHashSelection{})
 	caddy.RegisterModule(CookieHashSelection{})
-
-	weakrand.Seed(time.Now().UTC().UnixNano())
 }
 
 // RandomSelection is a policy that selects
@@ -70,12 +70,102 @@ func (r RandomSelection) Select(pool UpstreamPool, request *http.Request, _ http
 
 // UnmarshalCaddyfile sets up the module from Caddyfile tokens.
 func (r *RandomSelection) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for d.Next() {
-		if d.NextArg() {
-			return d.ArgErr()
-		}
+	d.Next() // consume policy name
+	if d.NextArg() {
+		return d.ArgErr()
 	}
 	return nil
+}
+
+// WeightedRoundRobinSelection is a policy that selects
+// a host based on weighted round-robin ordering.
+type WeightedRoundRobinSelection struct {
+	// The weight of each upstream in order,
+	// corresponding with the list of upstreams configured.
+	Weights     []int `json:"weights,omitempty"`
+	index       uint32
+	totalWeight int
+}
+
+// CaddyModule returns the Caddy module information.
+func (WeightedRoundRobinSelection) CaddyModule() caddy.ModuleInfo {
+	return caddy.ModuleInfo{
+		ID: "http.reverse_proxy.selection_policies.weighted_round_robin",
+		New: func() caddy.Module {
+			return new(WeightedRoundRobinSelection)
+		},
+	}
+}
+
+// UnmarshalCaddyfile sets up the module from Caddyfile tokens.
+func (r *WeightedRoundRobinSelection) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	d.Next() // consume policy name
+
+	args := d.RemainingArgs()
+	if len(args) == 0 {
+		return d.ArgErr()
+	}
+
+	for _, weight := range args {
+		weightInt, err := strconv.Atoi(weight)
+		if err != nil {
+			return d.Errf("invalid weight value '%s': %v", weight, err)
+		}
+		if weightInt < 0 {
+			return d.Errf("invalid weight value '%s': weight should be non-negative", weight)
+		}
+		r.Weights = append(r.Weights, weightInt)
+	}
+	return nil
+}
+
+// Provision sets up r.
+func (r *WeightedRoundRobinSelection) Provision(ctx caddy.Context) error {
+	for _, weight := range r.Weights {
+		r.totalWeight += weight
+	}
+	return nil
+}
+
+// Select returns an available host, if any.
+func (r *WeightedRoundRobinSelection) Select(pool UpstreamPool, _ *http.Request, _ http.ResponseWriter) *Upstream {
+	if len(pool) == 0 {
+		return nil
+	}
+	if len(r.Weights) < 2 {
+		return pool[0]
+	}
+	var index, totalWeight int
+	var weights []int
+
+	for _, w := range r.Weights {
+		if w > 0 {
+			weights = append(weights, w)
+		}
+	}
+	currentWeight := int(atomic.AddUint32(&r.index, 1)) % r.totalWeight
+	for i, weight := range weights {
+		totalWeight += weight
+		if currentWeight < totalWeight {
+			index = i
+			break
+		}
+	}
+
+	upstreams := make([]*Upstream, 0, len(weights))
+	for i, upstream := range pool {
+		if !upstream.Available() || r.Weights[i] == 0 {
+			continue
+		}
+		upstreams = append(upstreams, upstream)
+		if len(upstreams) == cap(upstreams) {
+			break
+		}
+	}
+	if len(upstreams) == 0 {
+		return nil
+	}
+	return upstreams[index%len(upstreams)]
 }
 
 // RandomChoiceSelection is a policy that selects
@@ -97,17 +187,17 @@ func (RandomChoiceSelection) CaddyModule() caddy.ModuleInfo {
 
 // UnmarshalCaddyfile sets up the module from Caddyfile tokens.
 func (r *RandomChoiceSelection) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for d.Next() {
-		if !d.NextArg() {
-			return d.ArgErr()
-		}
-		chooseStr := d.Val()
-		choose, err := strconv.Atoi(chooseStr)
-		if err != nil {
-			return d.Errf("invalid choice value '%s': %v", chooseStr, err)
-		}
-		r.Choose = choose
+	d.Next() // consume policy name
+
+	if !d.NextArg() {
+		return d.ArgErr()
 	}
+	chooseStr := d.Val()
+	choose, err := strconv.Atoi(chooseStr)
+	if err != nil {
+		return d.Errf("invalid choice value '%s': %v", chooseStr, err)
+	}
+	r.Choose = choose
 	return nil
 }
 
@@ -187,7 +277,7 @@ func (LeastConnSelection) Select(pool UpstreamPool, _ *http.Request, _ http.Resp
 		// sample: https://en.wikipedia.org/wiki/Reservoir_sampling
 		if numReqs == leastReqs {
 			count++
-			if count > 1 || (weakrand.Int()%count) == 0 { //nolint:gosec
+			if count == 1 || (weakrand.Int()%count) == 0 { //nolint:gosec
 				bestHost = host
 			}
 		}
@@ -198,10 +288,9 @@ func (LeastConnSelection) Select(pool UpstreamPool, _ *http.Request, _ http.Resp
 
 // UnmarshalCaddyfile sets up the module from Caddyfile tokens.
 func (r *LeastConnSelection) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for d.Next() {
-		if d.NextArg() {
-			return d.ArgErr()
-		}
+	d.Next() // consume policy name
+	if d.NextArg() {
+		return d.ArgErr()
 	}
 	return nil
 }
@@ -238,10 +327,9 @@ func (r *RoundRobinSelection) Select(pool UpstreamPool, _ *http.Request, _ http.
 
 // UnmarshalCaddyfile sets up the module from Caddyfile tokens.
 func (r *RoundRobinSelection) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for d.Next() {
-		if d.NextArg() {
-			return d.ArgErr()
-		}
+	d.Next() // consume policy name
+	if d.NextArg() {
+		return d.ArgErr()
 	}
 	return nil
 }
@@ -270,10 +358,9 @@ func (FirstSelection) Select(pool UpstreamPool, _ *http.Request, _ http.Response
 
 // UnmarshalCaddyfile sets up the module from Caddyfile tokens.
 func (r *FirstSelection) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for d.Next() {
-		if d.NextArg() {
-			return d.ArgErr()
-		}
+	d.Next() // consume policy name
+	if d.NextArg() {
+		return d.ArgErr()
 	}
 	return nil
 }
@@ -301,10 +388,9 @@ func (IPHashSelection) Select(pool UpstreamPool, req *http.Request, _ http.Respo
 
 // UnmarshalCaddyfile sets up the module from Caddyfile tokens.
 func (r *IPHashSelection) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for d.Next() {
-		if d.NextArg() {
-			return d.ArgErr()
-		}
+	d.Next() // consume policy name
+	if d.NextArg() {
+		return d.ArgErr()
 	}
 	return nil
 }
@@ -334,10 +420,9 @@ func (ClientIPHashSelection) Select(pool UpstreamPool, req *http.Request, _ http
 
 // UnmarshalCaddyfile sets up the module from Caddyfile tokens.
 func (r *ClientIPHashSelection) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for d.Next() {
-		if d.NextArg() {
-			return d.ArgErr()
-		}
+	d.Next() // consume policy name
+	if d.NextArg() {
+		return d.ArgErr()
 	}
 	return nil
 }
@@ -361,10 +446,9 @@ func (URIHashSelection) Select(pool UpstreamPool, req *http.Request, _ http.Resp
 
 // UnmarshalCaddyfile sets up the module from Caddyfile tokens.
 func (r *URIHashSelection) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for d.Next() {
-		if d.NextArg() {
-			return d.ArgErr()
-		}
+	d.Next() // consume policy name
+	if d.NextArg() {
+		return d.ArgErr()
 	}
 	return nil
 }
@@ -422,13 +506,14 @@ func (s QueryHashSelection) Select(pool UpstreamPool, req *http.Request, _ http.
 
 // UnmarshalCaddyfile sets up the module from Caddyfile tokens.
 func (s *QueryHashSelection) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for d.Next() {
-		if !d.NextArg() {
-			return d.ArgErr()
-		}
-		s.Key = d.Val()
+	d.Next() // consume policy name
+
+	if !d.NextArg() {
+		return d.ArgErr()
 	}
-	for nesting := d.Nesting(); d.NextBlock(nesting); {
+	s.Key = d.Val()
+
+	for d.NextBlock(0) {
 		switch d.Val() {
 		case "fallback":
 			if !d.NextArg() {
@@ -501,13 +586,14 @@ func (s HeaderHashSelection) Select(pool UpstreamPool, req *http.Request, _ http
 
 // UnmarshalCaddyfile sets up the module from Caddyfile tokens.
 func (s *HeaderHashSelection) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for d.Next() {
-		if !d.NextArg() {
-			return d.ArgErr()
-		}
-		s.Field = d.Val()
+	d.Next() // consume policy name
+
+	if !d.NextArg() {
+		return d.ArgErr()
 	}
-	for nesting := d.Nesting(); d.NextBlock(nesting); {
+	s.Field = d.Val()
+
+	for d.NextBlock(0) {
 		switch d.Val() {
 		case "fallback":
 			if !d.NextArg() {
@@ -535,6 +621,8 @@ type CookieHashSelection struct {
 	Name string `json:"name,omitempty"`
 	// Secret to hash (Hmac256) chosen upstream in cookie
 	Secret string `json:"secret,omitempty"`
+	// The cookie's Max-Age before it expires. Default is no expiry.
+	MaxAge caddy.Duration `json:"max_age,omitempty"`
 
 	// The fallback policy to use if the cookie is not present. Defaults to `random`.
 	FallbackRaw json.RawMessage `json:"fallback,omitempty" caddy:"namespace=http.reverse_proxy.selection_policies inline_key=policy"`
@@ -578,12 +666,25 @@ func (s CookieHashSelection) Select(pool UpstreamPool, req *http.Request, w http
 		if err != nil {
 			return upstream
 		}
-		http.SetCookie(w, &http.Cookie{
+		cookie := &http.Cookie{
 			Name:   s.Name,
 			Value:  sha,
 			Path:   "/",
 			Secure: false,
-		})
+		}
+		isProxyHttps := false
+		if trusted, ok := caddyhttp.GetVar(req.Context(), caddyhttp.TrustedProxyVarKey).(bool); ok && trusted {
+			xfp, xfpOk, _ := lastHeaderValue(req.Header, "X-Forwarded-Proto")
+			isProxyHttps = xfpOk && xfp == "https"
+		}
+		if req.TLS != nil || isProxyHttps {
+			cookie.Secure = true
+			cookie.SameSite = http.SameSiteNoneMode
+		}
+		if s.MaxAge > 0 {
+			cookie.MaxAge = int(time.Duration(s.MaxAge).Seconds())
+		}
+		http.SetCookie(w, cookie)
 		return upstream
 	}
 
@@ -611,6 +712,7 @@ func (s CookieHashSelection) Select(pool UpstreamPool, req *http.Request, w http
 //
 //	lb_policy cookie [<name> [<secret>]] {
 //		fallback <policy>
+//		max_age <duration>
 //	}
 //
 // By default name is `lb`
@@ -626,7 +728,7 @@ func (s *CookieHashSelection) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	default:
 		return d.ArgErr()
 	}
-	for nesting := d.Nesting(); d.NextBlock(nesting); {
+	for d.NextBlock(0) {
 		switch d.Val() {
 		case "fallback":
 			if !d.NextArg() {
@@ -640,6 +742,24 @@ func (s *CookieHashSelection) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return err
 			}
 			s.FallbackRaw = mod
+		case "max_age":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			if s.MaxAge != 0 {
+				return d.Err("cookie max_age already specified")
+			}
+			maxAge, err := caddy.ParseDuration(d.Val())
+			if err != nil {
+				return d.Errf("invalid duration: %s", d.Val())
+			}
+			if maxAge <= 0 {
+				return d.Errf("invalid duration: %s, max_age should be non-zero and positive", d.Val())
+			}
+			if d.NextArg() {
+				return d.ArgErr()
+			}
+			s.MaxAge = caddy.Duration(maxAge)
 		default:
 			return d.Errf("unrecognized option '%s'", d.Val())
 		}
@@ -720,7 +840,7 @@ func hostByHashing(pool []*Upstream, s string) *Upstream {
 	// see https://medium.com/i0exception/rendezvous-hashing-8c00e2fb58b0,
 	// https://randorithms.com/2020/12/26/rendezvous-hashing.html,
 	// and https://en.wikipedia.org/wiki/Rendezvous_hashing.
-	var highestHash uint32
+	var highestHash uint64
 	var upstream *Upstream
 	for _, up := range pool {
 		if !up.Available() {
@@ -736,10 +856,10 @@ func hostByHashing(pool []*Upstream, s string) *Upstream {
 }
 
 // hash calculates a fast hash based on s.
-func hash(s string) uint32 {
-	h := fnv.New32a()
+func hash(s string) uint64 {
+	h := xxhash.New()
 	_, _ = h.Write([]byte(s))
-	return h.Sum32()
+	return h.Sum64()
 }
 
 func loadFallbackPolicy(d *caddyfile.Dispenser) (json.RawMessage, error) {
@@ -762,6 +882,7 @@ var (
 	_ Selector = (*RandomChoiceSelection)(nil)
 	_ Selector = (*LeastConnSelection)(nil)
 	_ Selector = (*RoundRobinSelection)(nil)
+	_ Selector = (*WeightedRoundRobinSelection)(nil)
 	_ Selector = (*FirstSelection)(nil)
 	_ Selector = (*IPHashSelection)(nil)
 	_ Selector = (*ClientIPHashSelection)(nil)
@@ -770,8 +891,11 @@ var (
 	_ Selector = (*HeaderHashSelection)(nil)
 	_ Selector = (*CookieHashSelection)(nil)
 
-	_ caddy.Validator   = (*RandomChoiceSelection)(nil)
+	_ caddy.Validator = (*RandomChoiceSelection)(nil)
+
 	_ caddy.Provisioner = (*RandomChoiceSelection)(nil)
+	_ caddy.Provisioner = (*WeightedRoundRobinSelection)(nil)
 
 	_ caddyfile.Unmarshaler = (*RandomChoiceSelection)(nil)
+	_ caddyfile.Unmarshaler = (*WeightedRoundRobinSelection)(nil)
 )

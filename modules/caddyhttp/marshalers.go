@@ -40,7 +40,9 @@ func (r LoggableHTTPRequest) MarshalLogObject(enc zapcore.ObjectEncoder) error {
 
 	enc.AddString("remote_ip", ip)
 	enc.AddString("remote_port", port)
-	enc.AddString("client_ip", GetVar(r.Context(), ClientIPVarKey).(string))
+	if ip, ok := GetVar(r.Context(), ClientIPVarKey).(string); ok {
+		enc.AddString("client_ip", ip)
+	}
 	enc.AddString("proto", r.Proto)
 	enc.AddString("method", r.Method)
 	enc.AddString("host", r.Host)
@@ -49,6 +51,9 @@ func (r LoggableHTTPRequest) MarshalLogObject(enc zapcore.ObjectEncoder) error {
 		Header:               r.Header,
 		ShouldLogCredentials: r.ShouldLogCredentials,
 	})
+	if r.TransferEncoding != nil {
+		enc.AddArray("transfer_encoding", LoggableStringArray(r.TransferEncoding))
+	}
 	if r.TLS != nil {
 		enc.AddObject("tls", LoggableTLSConnState(*r.TLS))
 	}
@@ -73,7 +78,7 @@ func (h LoggableHTTPHeader) MarshalLogObject(enc zapcore.ObjectEncoder) error {
 		if !h.ShouldLogCredentials {
 			switch strings.ToLower(key) {
 			case "cookie", "set-cookie", "authorization", "proxy-authorization":
-				val = []string{}
+				val = []string{"REDACTED"} // see #5669. I still think ▒▒▒▒ would be cool.
 			}
 		}
 		enc.AddArray(key, LoggableStringArray(val))

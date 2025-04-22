@@ -11,8 +11,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/caddyserver/caddy/v2"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+
+	"github.com/caddyserver/caddy/v2"
 )
 
 func init() {
@@ -47,6 +49,13 @@ type SRVUpstreams struct {
 	// The interval at which to refresh the SRV lookup.
 	// Results are cached between lookups. Default: 1m
 	Refresh caddy.Duration `json:"refresh,omitempty"`
+
+	// If > 0 and there is an error with the lookup,
+	// continue to use the cached results for up to
+	// this long before trying again, (even though they
+	// are stale) instead of returning an error to the
+	// client. Default: 0s.
+	GracePeriod caddy.Duration `json:"grace_period,omitempty"`
 
 	// Configures the DNS resolver used to resolve the
 	// SRV address to SRV records.
@@ -113,7 +122,7 @@ func (su SRVUpstreams) GetUpstreams(r *http.Request) ([]*Upstream, error) {
 	cached := srvs[suAddr]
 	srvsMu.RUnlock()
 	if cached.isFresh() {
-		return cached.upstreams, nil
+		return allNew(cached.upstreams), nil
 	}
 
 	// otherwise, obtain a write-lock to update the cached value
@@ -125,13 +134,16 @@ func (su SRVUpstreams) GetUpstreams(r *http.Request) ([]*Upstream, error) {
 	// have refreshed it in the meantime before we re-obtained our lock
 	cached = srvs[suAddr]
 	if cached.isFresh() {
-		return cached.upstreams, nil
+		return allNew(cached.upstreams), nil
 	}
 
-	su.logger.Debug("refreshing SRV upstreams",
-		zap.String("service", service),
-		zap.String("proto", proto),
-		zap.String("name", name))
+	if c := su.logger.Check(zapcore.DebugLevel, "refreshing SRV upstreams"); c != nil {
+		c.Write(
+			zap.String("service", service),
+			zap.String("proto", proto),
+			zap.String("name", name),
+		)
+	}
 
 	_, records, err := su.resolver.LookupSRV(r.Context(), service, proto, name)
 	if err != nil {
@@ -139,20 +151,33 @@ func (su SRVUpstreams) GetUpstreams(r *http.Request) ([]*Upstream, error) {
 		// out and an error will be returned alongside the remaining results, if any." Thus, we
 		// only return an error if no records were also returned.
 		if len(records) == 0 {
+			if su.GracePeriod > 0 {
+				if c := su.logger.Check(zapcore.ErrorLevel, "SRV lookup failed; using previously cached"); c != nil {
+					c.Write(zap.Error(err))
+				}
+				cached.freshness = time.Now().Add(time.Duration(su.GracePeriod) - time.Duration(su.Refresh))
+				srvs[suAddr] = cached
+				return allNew(cached.upstreams), nil
+			}
 			return nil, err
 		}
-		su.logger.Warn("SRV records filtered", zap.Error(err))
+		if c := su.logger.Check(zapcore.WarnLevel, "SRV records filtered"); c != nil {
+			c.Write(zap.Error(err))
+		}
 	}
 
-	upstreams := make([]*Upstream, len(records))
+	upstreams := make([]Upstream, len(records))
 	for i, rec := range records {
-		su.logger.Debug("discovered SRV record",
-			zap.String("target", rec.Target),
-			zap.Uint16("port", rec.Port),
-			zap.Uint16("priority", rec.Priority),
-			zap.Uint16("weight", rec.Weight))
+		if c := su.logger.Check(zapcore.DebugLevel, "discovered SRV record"); c != nil {
+			c.Write(
+				zap.String("target", rec.Target),
+				zap.Uint16("port", rec.Port),
+				zap.Uint16("priority", rec.Priority),
+				zap.Uint16("weight", rec.Weight),
+			)
+		}
 		addr := net.JoinHostPort(rec.Target, strconv.Itoa(int(rec.Port)))
-		upstreams[i] = &Upstream{Dial: addr}
+		upstreams[i] = Upstream{Dial: addr}
 	}
 
 	// before adding a new one to the cache (as opposed to replacing stale one), make room if cache is full
@@ -169,7 +194,7 @@ func (su SRVUpstreams) GetUpstreams(r *http.Request) ([]*Upstream, error) {
 		upstreams:    upstreams,
 	}
 
-	return upstreams, nil
+	return allNew(upstreams), nil
 }
 
 func (su SRVUpstreams) String() string {
@@ -205,16 +230,29 @@ func (SRVUpstreams) formattedAddr(service, proto, name string) string {
 type srvLookup struct {
 	srvUpstreams SRVUpstreams
 	freshness    time.Time
-	upstreams    []*Upstream
+	upstreams    []Upstream
 }
 
 func (sl srvLookup) isFresh() bool {
 	return time.Since(sl.freshness) < time.Duration(sl.srvUpstreams.Refresh)
 }
 
-type ipVersions struct {
+type IPVersions struct {
 	IPv4 *bool `json:"ipv4,omitempty"`
 	IPv6 *bool `json:"ipv6,omitempty"`
+}
+
+func resolveIpVersion(versions *IPVersions) string {
+	resolveIpv4 := versions == nil || (versions.IPv4 == nil && versions.IPv6 == nil) || (versions.IPv4 != nil && *versions.IPv4)
+	resolveIpv6 := versions == nil || (versions.IPv6 == nil && versions.IPv4 == nil) || (versions.IPv6 != nil && *versions.IPv6)
+	switch {
+	case resolveIpv4 && !resolveIpv6:
+		return "ip4"
+	case !resolveIpv4 && resolveIpv6:
+		return "ip6"
+	default:
+		return "ip"
+	}
 }
 
 // AUpstreams provides upstreams from A/AAAA lookups.
@@ -247,9 +285,11 @@ type AUpstreams struct {
 	// The IP versions to resolve for. By default, both
 	// "ipv4" and "ipv6" will be enabled, which
 	// correspond to A and AAAA records respectively.
-	Versions *ipVersions `json:"versions,omitempty"`
+	Versions *IPVersions `json:"versions,omitempty"`
 
 	resolver *net.Resolver
+
+	logger *zap.Logger
 }
 
 // CaddyModule returns the Caddy module information.
@@ -260,7 +300,8 @@ func (AUpstreams) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-func (au *AUpstreams) Provision(_ caddy.Context) error {
+func (au *AUpstreams) Provision(ctx caddy.Context) error {
+	au.logger = ctx.Logger()
 	if au.Refresh == 0 {
 		au.Refresh = caddy.Duration(time.Minute)
 	}
@@ -296,9 +337,6 @@ func (au *AUpstreams) Provision(_ caddy.Context) error {
 func (au AUpstreams) GetUpstreams(r *http.Request) ([]*Upstream, error) {
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 
-	resolveIpv4 := au.Versions.IPv4 == nil || *au.Versions.IPv4
-	resolveIpv6 := au.Versions.IPv6 == nil || *au.Versions.IPv6
-
 	// Map ipVersion early, so we can use it as part of the cache-key.
 	// This should be fairly inexpensive and comes and the upside of
 	// allowing the same dynamic upstream (name + port combination)
@@ -307,15 +345,7 @@ func (au AUpstreams) GetUpstreams(r *http.Request) ([]*Upstream, error) {
 	// It also forced a cache-miss if a previously cached dynamic
 	// upstream changes its ip version, e.g. after a config reload,
 	// while keeping the cache-invalidation as simple as it currently is.
-	var ipVersion string
-	switch {
-	case resolveIpv4 && !resolveIpv6:
-		ipVersion = "ip4"
-	case !resolveIpv4 && resolveIpv6:
-		ipVersion = "ip6"
-	default:
-		ipVersion = "ip"
-	}
+	ipVersion := resolveIpVersion(au.Versions)
 
 	auStr := repl.ReplaceAll(au.String()+ipVersion, "")
 
@@ -324,7 +354,7 @@ func (au AUpstreams) GetUpstreams(r *http.Request) ([]*Upstream, error) {
 	cached := aAaaa[auStr]
 	aAaaaMu.RUnlock()
 	if cached.isFresh() {
-		return cached.upstreams, nil
+		return allNew(cached.upstreams), nil
 	}
 
 	// otherwise, obtain a write-lock to update the cached value
@@ -336,26 +366,37 @@ func (au AUpstreams) GetUpstreams(r *http.Request) ([]*Upstream, error) {
 	// have refreshed it in the meantime before we re-obtained our lock
 	cached = aAaaa[auStr]
 	if cached.isFresh() {
-		return cached.upstreams, nil
+		return allNew(cached.upstreams), nil
 	}
 
 	name := repl.ReplaceAll(au.Name, "")
 	port := repl.ReplaceAll(au.Port, "")
+
+	if c := au.logger.Check(zapcore.DebugLevel, "refreshing A upstreams"); c != nil {
+		c.Write(
+			zap.String("version", ipVersion),
+			zap.String("name", name),
+			zap.String("port", port),
+		)
+	}
 
 	ips, err := au.resolver.LookupIP(r.Context(), ipVersion, name)
 	if err != nil {
 		return nil, err
 	}
 
-	upstreams := make([]*Upstream, len(ips))
+	upstreams := make([]Upstream, len(ips))
 	for i, ip := range ips {
-		upstreams[i] = &Upstream{
+		if c := au.logger.Check(zapcore.DebugLevel, "discovered A record"); c != nil {
+			c.Write(zap.String("ip", ip.String()))
+		}
+		upstreams[i] = Upstream{
 			Dial: net.JoinHostPort(ip.String(), port),
 		}
 	}
 
 	// before adding a new one to the cache (as opposed to replacing stale one), make room if cache is full
-	if cached.freshness.IsZero() && len(srvs) >= 100 {
+	if cached.freshness.IsZero() && len(aAaaa) >= 100 {
 		for randomKey := range aAaaa {
 			delete(aAaaa, randomKey)
 			break
@@ -368,7 +409,7 @@ func (au AUpstreams) GetUpstreams(r *http.Request) ([]*Upstream, error) {
 		upstreams:  upstreams,
 	}
 
-	return upstreams, nil
+	return allNew(upstreams), nil
 }
 
 func (au AUpstreams) String() string { return net.JoinHostPort(au.Name, au.Port) }
@@ -376,7 +417,7 @@ func (au AUpstreams) String() string { return net.JoinHostPort(au.Name, au.Port)
 type aLookup struct {
 	aUpstreams AUpstreams
 	freshness  time.Time
-	upstreams  []*Upstream
+	upstreams  []Upstream
 }
 
 func (al aLookup) isFresh() bool {
@@ -441,11 +482,16 @@ func (mu MultiUpstreams) GetUpstreams(r *http.Request) ([]*Upstream, error) {
 
 		up, err := src.GetUpstreams(r)
 		if err != nil {
-			mu.logger.Error("upstream source returned error",
-				zap.Int("source_idx", i),
-				zap.Error(err))
+			if c := mu.logger.Check(zapcore.ErrorLevel, "upstream source returned error"); c != nil {
+				c.Write(
+					zap.Int("source_idx", i),
+					zap.Error(err),
+				)
+			}
 		} else if len(up) == 0 {
-			mu.logger.Warn("upstream source returned 0 upstreams", zap.Int("source_idx", i))
+			if c := mu.logger.Check(zapcore.WarnLevel, "upstream source returned 0 upstreams"); c != nil {
+				c.Write(zap.Int("source_idx", i))
+			}
 		} else {
 			upstreams = append(upstreams, up...)
 		}
@@ -480,6 +526,14 @@ func (u *UpstreamResolver) ParseAddresses() error {
 		u.netAddrs = append(u.netAddrs, addr)
 	}
 	return nil
+}
+
+func allNew(upstreams []Upstream) []*Upstream {
+	results := make([]*Upstream, len(upstreams))
+	for i := range upstreams {
+		results[i] = &Upstream{Dial: upstreams[i].Dial}
+	}
+	return results
 }
 
 var (

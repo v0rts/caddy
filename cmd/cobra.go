@@ -1,12 +1,17 @@
 package caddycmd
 
 import (
+	"fmt"
+
 	"github.com/spf13/cobra"
+
+	"github.com/caddyserver/caddy/v2"
 )
 
-var rootCmd = &cobra.Command{
-	Use: "caddy",
-	Long: `Caddy is an extensible server platform written in Go.
+var defaultFactory = newRootCommandFactory(func() *cobra.Command {
+	return &cobra.Command{
+		Use: "caddy",
+		Long: `Caddy is an extensible server platform written in Go.
 
 At its core, Caddy merely manages configuration. Modules are plugged
 in statically at compile-time to provide useful functionality. Caddy's
@@ -87,26 +92,36 @@ package installers: https://caddyserver.com/docs/install
 Instructions for running Caddy in production are also available:
 https://caddyserver.com/docs/running
 `,
-	Example: `  $ caddy run
+		Example: `  $ caddy run
   $ caddy run --config caddy.json
   $ caddy reload --config caddy.json
   $ caddy stop`,
 
-	// kind of annoying to have all the help text printed out if
-	// caddy has an error provisioning its modules, for instance...
-	SilenceUsage: true,
-}
+		// kind of annoying to have all the help text printed out if
+		// caddy has an error provisioning its modules, for instance...
+		SilenceUsage: true,
+		Version:      onlyVersionText(),
+	}
+})
 
 const fullDocsFooter = `Full documentation is available at:
 https://caddyserver.com/docs/command-line`
 
 func init() {
-	rootCmd.SetHelpTemplate(rootCmd.HelpTemplate() + "\n" + fullDocsFooter + "\n")
+	defaultFactory.Use(func(rootCmd *cobra.Command) {
+		rootCmd.SetVersionTemplate("{{.Version}}\n")
+		rootCmd.SetHelpTemplate(rootCmd.HelpTemplate() + "\n" + fullDocsFooter + "\n")
+	})
+}
+
+func onlyVersionText() string {
+	_, f := caddy.Version()
+	return f
 }
 
 func caddyCmdToCobra(caddyCmd Command) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   caddyCmd.Name,
+		Use:   caddyCmd.Name + " " + caddyCmd.Usage,
 		Short: caddyCmd.Short,
 		Long:  caddyCmd.Long,
 	}
@@ -123,7 +138,24 @@ func caddyCmdToCobra(caddyCmd Command) *cobra.Command {
 // in a cobra command's RunE field.
 func WrapCommandFuncForCobra(f CommandFunc) func(cmd *cobra.Command, _ []string) error {
 	return func(cmd *cobra.Command, _ []string) error {
-		_, err := f(Flags{cmd.Flags()})
+		status, err := f(Flags{cmd.Flags()})
+		if status > 1 {
+			cmd.SilenceErrors = true
+			return &exitError{ExitCode: status, Err: err}
+		}
 		return err
 	}
+}
+
+// exitError carries the exit code from CommandFunc to Main()
+type exitError struct {
+	ExitCode int
+	Err      error
+}
+
+func (e *exitError) Error() string {
+	if e.Err == nil {
+		return fmt.Sprintf("exiting with status %d", e.ExitCode)
+	}
+	return e.Err.Error()
 }

@@ -15,16 +15,22 @@
 package proxyprotocol
 
 import (
-	"fmt"
 	"net"
+	"net/netip"
 	"time"
 
+	goproxy "github.com/pires/go-proxyproto"
+
 	"github.com/caddyserver/caddy/v2"
-	"github.com/mastercactapus/proxyprotocol"
 )
 
 // ListenerWrapper provides PROXY protocol support to Caddy by implementing
-// the caddy.ListenerWrapper interface. It must be loaded before the `tls` listener.
+// the caddy.ListenerWrapper interface. If a connection is received via Unix
+// socket, it's trusted. Otherwise, it's checked against the Allow/Deny lists,
+// then it's handled by the FallbackPolicy.
+//
+// It must be loaded before the `tls` listener because the PROXY protocol
+// encapsulates the TLS data.
 //
 // Credit goes to https://github.com/mastercactapus/caddy2-proxyprotocol for having
 // initially implemented this as a plugin.
@@ -37,32 +43,102 @@ type ListenerWrapper struct {
 	// Allow is an optional list of CIDR ranges to
 	// allow/require PROXY headers from.
 	Allow []string `json:"allow,omitempty"`
+	allow []netip.Prefix
 
-	rules []proxyprotocol.Rule
+	// Deny is an optional list of CIDR ranges to
+	// deny PROXY headers from.
+	Deny []string `json:"deny,omitempty"`
+	deny []netip.Prefix
+
+	// FallbackPolicy specifies the policy to use if the downstream
+	// IP address is not in the Allow list nor is in the Deny list.
+	//
+	// NOTE: The generated docs which describe the value of this
+	// field is wrong because of how this type unmarshals JSON in a
+	// custom way. The field expects a string, not a number.
+	//
+	// Accepted values are: IGNORE, USE, REJECT, REQUIRE, SKIP
+	//
+	// - IGNORE: address from PROXY header, but accept connection
+	//
+	// - USE: address from PROXY header
+	//
+	// - REJECT: connection when PROXY header is sent
+	//   Note: even though the first read on the connection returns an error if
+	//   a PROXY header is present, subsequent reads do not. It is the task of
+	//   the code using the connection to handle that case properly.
+	//
+	// - REQUIRE: connection to send PROXY header, reject if not present
+	//   Note: even though the first read on the connection returns an error if
+	//   a PROXY header is not present, subsequent reads do not. It is the task
+	//   of the code using the connection to handle that case properly.
+	//
+	// - SKIP: accepts a connection without requiring the PROXY header.
+	//   Note: an example usage can be found in the SkipProxyHeaderForCIDR
+	//   function.
+	//
+	// Default: IGNORE
+	//
+	// Policy definitions are here: https://pkg.go.dev/github.com/pires/go-proxyproto@v0.7.0#Policy
+	FallbackPolicy Policy `json:"fallback_policy,omitempty"`
+
+	policy goproxy.ConnPolicyFunc
 }
 
 // Provision sets up the listener wrapper.
 func (pp *ListenerWrapper) Provision(ctx caddy.Context) error {
-	rules := make([]proxyprotocol.Rule, 0, len(pp.Allow))
-	for _, s := range pp.Allow {
-		_, n, err := net.ParseCIDR(s)
+	for _, cidr := range pp.Allow {
+		ipnet, err := netip.ParsePrefix(cidr)
 		if err != nil {
-			return fmt.Errorf("invalid subnet '%s': %w", s, err)
+			return err
 		}
-		rules = append(rules, proxyprotocol.Rule{
-			Timeout: time.Duration(pp.Timeout),
-			Subnet:  n,
-		})
+		pp.allow = append(pp.allow, ipnet)
+	}
+	for _, cidr := range pp.Deny {
+		ipnet, err := netip.ParsePrefix(cidr)
+		if err != nil {
+			return err
+		}
+		pp.deny = append(pp.deny, ipnet)
 	}
 
-	pp.rules = rules
+	pp.policy = func(options goproxy.ConnPolicyOptions) (goproxy.Policy, error) {
+		// trust unix sockets
+		if network := options.Upstream.Network(); caddy.IsUnixNetwork(network) || caddy.IsFdNetwork(network) {
+			return goproxy.USE, nil
+		}
+		ret := pp.FallbackPolicy
+		host, _, err := net.SplitHostPort(options.Upstream.String())
+		if err != nil {
+			return goproxy.REJECT, err
+		}
 
+		ip, err := netip.ParseAddr(host)
+		if err != nil {
+			return goproxy.REJECT, err
+		}
+		for _, ipnet := range pp.deny {
+			if ipnet.Contains(ip) {
+				return goproxy.REJECT, nil
+			}
+		}
+		for _, ipnet := range pp.allow {
+			if ipnet.Contains(ip) {
+				ret = PolicyUSE
+				break
+			}
+		}
+		return policyToGoProxyPolicy[ret], nil
+	}
 	return nil
 }
 
 // WrapListener adds PROXY protocol support to the listener.
 func (pp *ListenerWrapper) WrapListener(l net.Listener) net.Listener {
-	pl := proxyprotocol.NewListener(l, time.Duration(pp.Timeout))
-	pl.SetFilter(pp.rules)
+	pl := &goproxy.Listener{
+		Listener:          l,
+		ReadHeaderTimeout: time.Duration(pp.Timeout),
+	}
+	pl.ConnPolicy = pp.policy
 	return pl
 }

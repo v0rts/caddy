@@ -176,9 +176,7 @@ func testH2ToH2CStreamServeH2C(t *testing.T) *http.Server {
 
 		w.Header().Set("Cache-Control", "no-store")
 		w.WriteHeader(200)
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
-		}
+		http.NewResponseController(w).Flush()
 
 		buf := make([]byte, 4*1024)
 
@@ -336,7 +334,7 @@ func TestH2ToH1ChunkedResponse(t *testing.T) {
 		ProtoMinor: 0,
 		Header:     make(http.Header),
 	}
-	// underlying transport will automaticlly add gzip
+	// underlying transport will automatically add gzip
 	// req.Header.Set("Accept-Encoding", "gzip")
 	go func() {
 		fmt.Fprint(w, expectedBody)
@@ -362,7 +360,6 @@ func TestH2ToH1ChunkedResponse(t *testing.T) {
 
 func testH2ToH1ChunkedResponseServeH1(t *testing.T) *http.Server {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-
 		if r.Host != "127.0.0.1:9443" {
 			t.Errorf("r.Host doesn't match, %v!", r.Host)
 			w.WriteHeader(http.StatusNotFound)

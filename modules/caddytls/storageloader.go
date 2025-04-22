@@ -17,9 +17,11 @@ package caddytls
 import (
 	"crypto/tls"
 	"fmt"
+	"strings"
+
+	"github.com/caddyserver/certmagic"
 
 	"github.com/caddyserver/caddy/v2"
-	"github.com/caddyserver/certmagic"
 )
 
 func init() {
@@ -51,6 +53,22 @@ func (StorageLoader) CaddyModule() caddy.ModuleInfo {
 func (sl *StorageLoader) Provision(ctx caddy.Context) error {
 	sl.storage = ctx.Storage()
 	sl.ctx = ctx
+
+	repl, ok := ctx.Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	if !ok {
+		repl = caddy.NewReplacer()
+	}
+	for k, pair := range sl.Pairs {
+		for i, tag := range pair.Tags {
+			pair.Tags[i] = repl.ReplaceKnown(tag, "")
+		}
+		sl.Pairs[k] = CertKeyFilePair{
+			Certificate: repl.ReplaceKnown(pair.Certificate, ""),
+			Key:         repl.ReplaceKnown(pair.Key, ""),
+			Format:      repl.ReplaceKnown(pair.Format, ""),
+			Tags:        pair.Tags,
+		}
+	}
 	return nil
 }
 
@@ -71,8 +89,16 @@ func (sl StorageLoader) LoadCertificates() ([]Certificate, error) {
 		switch pair.Format {
 		case "":
 			fallthrough
+
 		case "pem":
+			// if the start of the key file looks like an encrypted private key,
+			// reject it with a helpful error message
+			if strings.Contains(string(keyData[:40]), "ENCRYPTED") {
+				return nil, fmt.Errorf("encrypted private keys are not supported; please decrypt the key first")
+			}
+
 			cert, err = tls.X509KeyPair(certData, keyData)
+
 		default:
 			return nil, fmt.Errorf("unrecognized certificate/key encoding format: %s", pair.Format)
 		}

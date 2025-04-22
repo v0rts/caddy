@@ -15,17 +15,17 @@
 package metrics
 
 import (
+	"errors"
 	"net/http"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.uber.org/zap"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-
-	"go.uber.org/zap"
-
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func init() {
@@ -63,7 +63,11 @@ func (l *zapLogger) Println(v ...any) {
 // Provision sets up m.
 func (m *Metrics) Provision(ctx caddy.Context) error {
 	log := ctx.Logger()
-	m.metricsHandler = createMetricsHandler(&zapLogger{log}, !m.DisableOpenMetrics)
+	registry := ctx.GetMetricsRegistry()
+	if registry == nil {
+		return errors.New("no metrics registry found")
+	}
+	m.metricsHandler = createMetricsHandler(&zapLogger{log}, !m.DisableOpenMetrics, registry)
 	return nil
 }
 
@@ -79,19 +83,18 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 //	    disable_openmetrics
 //	}
 func (m *Metrics) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for d.Next() {
-		args := d.RemainingArgs()
-		if len(args) > 0 {
-			return d.ArgErr()
-		}
+	d.Next() // consume directive name
+	args := d.RemainingArgs()
+	if len(args) > 0 {
+		return d.ArgErr()
+	}
 
-		for d.NextBlock(0) {
-			switch d.Val() {
-			case "disable_openmetrics":
-				m.DisableOpenMetrics = true
-			default:
-				return d.Errf("unrecognized subdirective %q", d.Val())
-			}
+	for d.NextBlock(0) {
+		switch d.Val() {
+		case "disable_openmetrics":
+			m.DisableOpenMetrics = true
+		default:
+			return d.Errf("unrecognized subdirective %q", d.Val())
 		}
 	}
 	return nil
@@ -109,9 +112,9 @@ var (
 	_ caddyfile.Unmarshaler       = (*Metrics)(nil)
 )
 
-func createMetricsHandler(logger promhttp.Logger, enableOpenMetrics bool) http.Handler {
-	return promhttp.InstrumentMetricHandler(prometheus.DefaultRegisterer,
-		promhttp.HandlerFor(prometheus.DefaultGatherer, promhttp.HandlerOpts{
+func createMetricsHandler(logger promhttp.Logger, enableOpenMetrics bool, registry *prometheus.Registry) http.Handler {
+	return promhttp.InstrumentMetricHandler(registry,
+		promhttp.HandlerFor(registry, promhttp.HandlerOpts{
 			// will only log errors if logger is non-nil
 			ErrorLog: logger,
 

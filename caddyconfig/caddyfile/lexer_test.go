@@ -285,6 +285,18 @@ EOF same-line-arg
 		},
 		{
 			input: []byte(`heredoc <<EOF
+EOF
+	HERE same-line-arg
+	`),
+			expected: []Token{
+				{Line: 1, Text: `heredoc`},
+				{Line: 1, Text: ``},
+				{Line: 3, Text: `HERE`},
+				{Line: 3, Text: `same-line-arg`},
+			},
+		},
+		{
+			input: []byte(`heredoc <<EOF
 		EOF same-line-arg
 	`),
 			expected: []Token{
@@ -322,15 +334,59 @@ EOF same-line-arg
 			},
 		},
 		{
-			input: []byte(`heredoc <EOF
+			input: []byte(`escaped-heredoc \<< >>`),
+			expected: []Token{
+				{Line: 1, Text: `escaped-heredoc`},
+				{Line: 1, Text: `<<`},
+				{Line: 1, Text: `>>`},
+			},
+		},
+		{
+			input: []byte(`not-a-heredoc <EOF
 	content
-	EOF same-line-arg
 	`),
 			expected: []Token{
-				{Line: 1, Text: `heredoc`},
+				{Line: 1, Text: `not-a-heredoc`},
 				{Line: 1, Text: `<EOF`},
 				{Line: 2, Text: `content`},
-				{Line: 3, Text: `EOF`},
+			},
+		},
+		{
+			input: []byte(`not-a-heredoc <<<EOF content`),
+			expected: []Token{
+				{Line: 1, Text: `not-a-heredoc`},
+				{Line: 1, Text: `<<<EOF`},
+				{Line: 1, Text: `content`},
+			},
+		},
+		{
+			input: []byte(`not-a-heredoc "<<" ">>"`),
+			expected: []Token{
+				{Line: 1, Text: `not-a-heredoc`},
+				{Line: 1, Text: `<<`},
+				{Line: 1, Text: `>>`},
+			},
+		},
+		{
+			input: []byte(`not-a-heredoc << >>`),
+			expected: []Token{
+				{Line: 1, Text: `not-a-heredoc`},
+				{Line: 1, Text: `<<`},
+				{Line: 1, Text: `>>`},
+			},
+		},
+		{
+			input: []byte(`not-a-heredoc <<HERE SAME LINE
+	content
+	HERE same-line-arg
+	`),
+			expected: []Token{
+				{Line: 1, Text: `not-a-heredoc`},
+				{Line: 1, Text: `<<HERE`},
+				{Line: 1, Text: `SAME`},
+				{Line: 1, Text: `LINE`},
+				{Line: 2, Text: `content`},
+				{Line: 3, Text: `HERE`},
 				{Line: 3, Text: `same-line-arg`},
 			},
 		},
@@ -366,12 +422,9 @@ EOF same-line-arg
 			},
 		},
 		{
-			input: []byte(`heredoc <<HERE SAME LINE
-	content
-	HERE same-line-arg
-	`),
+			input:        []byte("not-a-heredoc <<\n"),
 			expectErr:    true,
-			errorMessage: "heredoc marker on line #1 must contain only alpha-numeric characters, dashes and underscores; got 'HERE SAME LINE'",
+			errorMessage: "missing opening heredoc marker on line #1; must contain only alpha-numeric characters, dashes and underscores; got empty string",
 		},
 		{
 			input: []byte(`heredoc <<<EOF
@@ -403,6 +456,48 @@ EOF same-line-arg
 	`),
 			expectErr:    true,
 			errorMessage: "mismatched leading whitespace in heredoc <<EOF on line #2 [        content], expected whitespace [\t\t] to match the closing marker",
+		},
+		{
+			input: []byte(`heredoc <<EOF
+The next line is a blank line
+
+The previous line is a blank line
+EOF`),
+			expected: []Token{
+				{Line: 1, Text: "heredoc"},
+				{Line: 1, Text: "The next line is a blank line\n\nThe previous line is a blank line"},
+			},
+		},
+		{
+			input: []byte(`heredoc <<EOF
+	One tab indented heredoc with blank next line
+
+	One tab indented heredoc with blank previous line
+	EOF`),
+			expected: []Token{
+				{Line: 1, Text: "heredoc"},
+				{Line: 1, Text: "One tab indented heredoc with blank next line\n\nOne tab indented heredoc with blank previous line"},
+			},
+		},
+		{
+			input: []byte(`heredoc <<EOF
+The next line is a blank line with one tab
+	
+The previous line is a blank line with one tab
+EOF`),
+			expected: []Token{
+				{Line: 1, Text: "heredoc"},
+				{Line: 1, Text: "The next line is a blank line with one tab\n\t\nThe previous line is a blank line with one tab"},
+			},
+		},
+		{
+			input: []byte(`heredoc <<EOF
+		The next line is a blank line with one tab less than the correct indentation
+	
+		The previous line is a blank line with one tab less than the correct indentation
+		EOF`),
+			expectErr:    true,
+			errorMessage: "mismatched leading whitespace in heredoc <<EOF on line #3 [\t], expected whitespace [\t\t] to match the closing marker",
 		},
 	}
 

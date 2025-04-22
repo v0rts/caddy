@@ -4,11 +4,12 @@ import (
 	"fmt"
 	"net/http"
 
+	"go.uber.org/zap"
+
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-	"go.uber.org/zap"
 )
 
 func init() {
@@ -87,20 +88,18 @@ func (ot *Tracing) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		"span": &ot.SpanName,
 	}
 
-	for d.Next() {
-		args := d.RemainingArgs()
-		if len(args) > 0 {
-			return d.ArgErr()
-		}
+	d.Next() // consume directive name
+	if d.NextArg() {
+		return d.ArgErr()
+	}
 
-		for d.NextBlock(0) {
-			if dst, ok := paramsMap[d.Val()]; ok {
-				if err := setParameter(d, dst); err != nil {
-					return err
-				}
-			} else {
-				return d.ArgErr()
+	for d.NextBlock(0) {
+		if dst, ok := paramsMap[d.Val()]; ok {
+			if err := setParameter(d, dst); err != nil {
+				return err
 			}
+		} else {
+			return d.ArgErr()
 		}
 	}
 	return nil
